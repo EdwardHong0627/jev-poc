@@ -265,10 +265,12 @@ def _lookup(data: dict, keys: list[str]) -> _LookupResult:
     """Walk *keys* inside *data*, returning a result indicating whether the
     path exists and is a dict at every component.
 
-    ``present=True``, ``value=...`` — all keys found and final value is a dict.
-    ``present=True``, ``value=None`` — path exists but an intermediate or
-    leaf is not a dict (malformed).
-    ``present=False``, ``value=None`` — key chain is genuinely absent.
+    ``present=True``, ``value=<dict>`` — all keys found, final value is a dict.
+    ``present=True``, ``value=None``, ``non_dict_at=<i>`` — leaf at index *i* is
+    non-dict (path reached the final key but value is not a dict).
+    ``present=False``, ``non_dict_at=<i>`` — an intermediate at index *i* is
+    non-dict, so traversal stops there.
+    ``present=False``, ``non_dict_at=None`` — key chain is genuinely absent.
     """
     cur: object = data
     non_dict_at: int | None = None  # index where non-dict was found
