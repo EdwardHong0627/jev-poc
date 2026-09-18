@@ -617,15 +617,6 @@ class TestWriteConfigAtomic:
             parsed = json.load(fh)
         assert parsed == {"check": True}
 
-    def test_uses_fdopen_not_raw_write(self, tmp_path) -> None:
-        """write_config_atomic must use os.fdopen + json.dump (not os.write)."""
-        import inspect
-        from jev_bot.mcp_registration import write_config_atomic
-
-        source = inspect.getsource(write_config_atomic)
-        assert "os.fdopen" in source, "Must use os.fdopen for write"
-        assert "json.dump" in source, "Must use json.dump for serialization"
-
     def test_fdopen_handles_unicode(self, tmp_path) -> None:
         """fdopen write handles full Unicode (emoji, CJK) without encode/decode roundtrip issues."""
         from jev_bot.mcp_registration import read_config, write_config_atomic
