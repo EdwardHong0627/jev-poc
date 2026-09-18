@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from copy import deepcopy
+
 JEV_GIT_URL = "git+https://github.com/EdwardHong0627/jev-poc.git"
 
 
@@ -122,13 +124,13 @@ def registration_target(harness: str) -> Scopes:
 
 
 def canonical_entry(harness: str) -> dict:
-    """Return the transport-specific JSON entry dict for *harness*.
+    """Return a copy of the transport-specific JSON entry dict for *harness*.
 
     Raises ``ValueError`` when *harness* is not recognized.
     """
     if harness not in _CANONICAL_ENTRIES:
         raise ValueError(
             f"'{harness}' is not a recognized MCP harness "
-            f"(expected one of {list(REGISTRY)})"
+            f"(expected one of {list(_CANONICAL_ENTRIES)})"
         )
-    return _CANONICAL_ENTRIES[harness]
+    return deepcopy(_CANONICAL_ENTRIES[harness])

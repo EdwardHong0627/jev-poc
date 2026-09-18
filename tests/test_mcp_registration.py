@@ -89,8 +89,6 @@ class TestClaudeCodeEntry:
 
     def test_no_token_or_endpoint(self, entry: dict) -> None:
         """No credential or endpoint information in the entry."""
-        for val in str(entry).lower():
-            pass  # structure-based check below
         keys_flat = set()
         for v in entry.values():
             if isinstance(v, list):
@@ -257,6 +255,41 @@ class TestErrors:
     def test_canonical_entry_rejects_blank(self) -> None:
         with pytest.raises(ValueError, match="not a recognized MCP harness"):
             canonical_entry("")
+
+    def test_canonical_entry_error_mentions_canonical_entries(self) -> None:
+        """Error message should list the _CANONICAL_ENTRIES keys, not REGISTRY."""
+        with pytest.raises(ValueError) as ctx:
+            canonical_entry("bogus")
+        error_msg = str(ctx.value)
+        # Both dicts share the same keys, so the output is the same;
+        # verify all four harnesses are listed.
+        for harness in HARNESSES:
+            assert harness in error_msg
+        # Verify the error does not mention REGISTRY
+        assert "REGISTRY" not in error_msg
+
+
+class TestCanonicalEntryDefensiveCopy:
+    """canonical_entry must return a copy so callers cannot mutate shared data."""
+
+    def test_mutation_does_not_affect_later_lookup(self) -> None:
+        entry1 = canonical_entry("claude-code")
+        entry1["type"] = "spoofed"
+        entry1["args"].append("corrupted")
+        entry2 = canonical_entry("claude-code")
+        assert entry2["type"] == "stdio"
+        assert "corrupted" not in entry2["args"]
+
+    def test_mutation_does_not_affect_other_harnesses(self) -> None:
+        entry = canonical_entry("claude-code")
+        entry["type"] = "spoofed"
+        other = canonical_entry("opencode")
+        assert other["type"] == "local"
+
+    def test_canonical_entry_returns_new_dict_each_call(self) -> None:
+        entry1 = canonical_entry("pi")
+        entry2 = canonical_entry("pi")
+        assert entry1 is not entry2
 
 
 # ── Specific path-key assertions ────────────────────────────────────
