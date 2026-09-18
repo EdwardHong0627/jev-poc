@@ -252,16 +252,51 @@ def _split_server_path(server_path: str) -> list[str]:
     return server_path.split(".")
 
 
+@dataclass
+class _LookupResult:
+    """Internal result type for nested-path lookups."""
+
+    present: bool
+    value: dict | None
+    non_dict_at: int | None = None  # index where non-dict was found
+
+
+def _lookup(data: dict, keys: list[str]) -> _LookupResult:
+    """Walk *keys* inside *data*, returning a result indicating whether the
+    path exists and is a dict at every component.
+
+    ``present=True``, ``value=...`` — all keys found and final value is a dict.
+    ``present=True``, ``value=None`` — path exists but an intermediate or
+    leaf is not a dict (malformed).
+    ``present=False``, ``value=None`` — key chain is genuinely absent.
+    """
+    cur: object = data
+    non_dict_at: int | None = None  # index where non-dict was found
+    for i, key in enumerate(keys):
+        if not isinstance(cur, dict) or key not in cur:
+            return _LookupResult(
+                present=False, value=None, non_dict_at=non_dict_at
+            )
+        cur = cur[key]
+        if not isinstance(cur, dict):
+            non_dict_at = i
+            if i == len(keys) - 1:
+                # Leaf is non-dict — definitely present but malformed.
+                return _LookupResult(present=True, value=None, non_dict_at=i)
+    if non_dict_at is not None:
+        # Should not happen (loop already catches non-dict), but guard.
+        return _LookupResult(present=True, value=None, non_dict_at=non_dict_at)
+    return _LookupResult(present=True, value=cur)
+
+
+# Legacy name for _get_nested — returns None when path is absent or non-dict,
+# dict value otherwise. Kept for test compatibility.
 def _get_nested(data: dict, keys: list[str]) -> dict | None:
     """Walk *keys* inside *data*, returning ``None`` if any key is missing."""
-    cur: dict | None = data
-    for key in keys:
-        if not isinstance(cur, dict) or key not in cur:
-            return None
-        cur = cur[key]
-    if not isinstance(cur, dict):
+    result = _lookup(data, keys)
+    if not result.present:
         return None
-    return cur
+    return result.value  # type: ignore[return-value]
 
 
 def _set_nested(data: dict, keys: list[str], value: dict) -> None:
@@ -331,16 +366,19 @@ def classify_server_entry(
     keys = _split_server_path(scopes.project.server_path)
 
     config = read_config(config_path, stop_root=stop_root)
-    entry = _get_nested(config, keys)
+    result = _lookup(config, keys)
 
-    if entry is None:
+    if result.non_dict_at is not None:
+        # Path exists at some level but hits a non-dict — FOREIGN.
+        return ServerEntryState.FOREIGN
+    if not result.present:
+        # Key chain is genuinely absent.
         return ServerEntryState.ABSENT
+    if result.value != canonical:
+        # Present dict doesn't match canonical spec.
+        return ServerEntryState.FOREIGN
 
-    # Compare against canonical (same keys+values).
-    if entry == canonical:
-        return ServerEntryState.CANONICAL
-
-    return ServerEntryState.FOREIGN
+    return ServerEntryState.CANONICAL
 
 
 # ── Install / Uninstall ──────────────────────────────────────────────

@@ -474,6 +474,255 @@ class TestUninstallScopeValidation:
             uninstall_server("claude-code", project_root=project, user_home=home)
 
 
+# ── 3b. Malformed / non-dict server-path values ──────────────────────
+
+
+class _BuildPath:
+    """Helper to build nested dicts following a dotted server_path."""
+
+    @staticmethod
+    def set(data: dict, keys: list[str]) -> dict:
+        """Set keys[-1] inside nested dicts along *keys*."""
+        cur = data
+        for key in keys[:-1]:
+            cur.setdefault(key, {})
+            cur = cur[key]
+        # Set leaf at deepest level (for use in tests)
+        return cur
+
+    @staticmethod
+    def set_leaf(data: dict, keys: list[str], value: object) -> None:
+        """Set the leaf value at the deepest nested dict."""
+        cur = data
+        for key in keys[:-1]:
+            cur.setdefault(key, {})
+            cur = cur[key]
+        cur[keys[-1]] = value
+
+
+class TestMalformedNullLeaf:
+    """A null (None) leaf at the jev position is classified FOREIGN."""
+
+    @pytest.mark.parametrize("harness", HARNESSES)
+    def test_project_scope(self, tmp_path: Path, harness: str) -> None:
+        project = _fixture_project(tmp_path, harness)
+        scopes = registration_target(harness).project
+        config_path = project / scopes.path_key
+        keys = scopes.server_path.split(".")
+        data: dict = {}
+        _BuildPath.set_leaf(data, keys, None)  # null leaf
+        _write_json(config_path, data)
+
+        assert classify_server_entry(harness, config_path, stop_root=project) == ServerEntryState.FOREIGN
+
+
+class TestMalformedStringLeaf:
+    """A string leaf at the jev position is classified FOREIGN."""
+
+    @pytest.mark.parametrize("harness", HARNESSES)
+    def test_project_scope(self, tmp_path: Path, harness: str) -> None:
+        project = _fixture_project(tmp_path, harness)
+        scopes = registration_target(harness).project
+        config_path = project / scopes.path_key
+        keys = scopes.server_path.split(".")
+        data: dict = {}
+        _BuildPath.set_leaf(data, keys, "not-a-dict")
+        _write_json(config_path, data)
+
+        assert classify_server_entry(harness, config_path, stop_root=project) == ServerEntryState.FOREIGN
+
+
+class TestMalformedListLeaf:
+    """A list leaf at the jev position is classified FOREIGN."""
+
+    @pytest.mark.parametrize("harness", HARNESSES)
+    def test_project_scope(self, tmp_path: Path, harness: str) -> None:
+        project = _fixture_project(tmp_path, harness)
+        scopes = registration_target(harness).project
+        config_path = project / scopes.path_key
+        keys = scopes.server_path.split(".")
+        data: dict = {}
+        _BuildPath.set_leaf(data, keys, [1, 2, 3])
+        _write_json(config_path, data)
+
+        assert classify_server_entry(harness, config_path, stop_root=project) == ServerEntryState.FOREIGN
+
+
+class TestMalformedNonDictIntermediate:
+    """A non-dict value on an intermediate path key is classified FOREIGN."""
+
+    @pytest.mark.parametrize("harness", HARNESSES)
+    def test_project_scope(self, tmp_path: Path, harness: str) -> None:
+        """For multi-key paths like 'mcp.servers.jev', corrupting
+        an intermediate (e.g. 'mcp' = "bad") makes the whole path FOREIGN."""
+        project = _fixture_project(tmp_path, harness)
+        scopes = registration_target(harness).project
+        config_path = project / scopes.path_key
+        keys = scopes.server_path.split(".")
+        if len(keys) <= 1:
+            pytest.skip("single-key path; intermediate corruption not applicable")
+        data: dict = {}
+        # Set only the first key to a non-dict
+        data[keys[0]] = "not-a-dict"
+        _write_json(config_path, data)
+
+        assert classify_server_entry(harness, config_path, stop_root=project) == ServerEntryState.FOREIGN
+
+
+class TestInstallWithMalformedNull:
+    """Normal install on null leaf preserves existing siblings, errors on jev replacement."""
+
+    @pytest.mark.parametrize("harness", HARNESSES)
+    def test_project_scope(self, tmp_path: Path, harness: str) -> None:
+        project = _fixture_project(tmp_path, harness)
+        scopes = registration_target(harness).project
+        config_path = project / scopes.path_key
+        keys = scopes.server_path.split(".")
+        data: dict = {}
+        _BuildPath.set_leaf(data, keys, None)
+        data["other"] = {"a": 1}
+        _write_json(config_path, data)
+
+        # classify says FOREIGN → normal install raises, does NOT mutate
+        with pytest.raises(ValueError, match="Refusing to install"):
+            install_server(harness, project_root=project)
+
+        # Siblings intact
+        assert read_config(config_path, stop_root=project).get("other") == {"a": 1}
+
+    @pytest.mark.parametrize("harness", HARNESSES)
+    def test_force_replaces_only_jev(self, tmp_path: Path, harness: str) -> None:
+        project = _fixture_project(tmp_path, harness)
+        scopes = registration_target(harness).project
+        config_path = project / scopes.path_key
+        keys = scopes.server_path.split(".")
+        data: dict = {}
+        _BuildPath.set_leaf(data, keys, None)
+        data["sibling"] = {"b": 2}
+        _write_json(config_path, data)
+
+        install_server(harness, project_root=project, force=True)
+
+        # jev is now canonical
+        data_after = read_config(config_path, stop_root=project)
+        entry = data_after
+        for key in keys:
+            entry = entry[key]
+        assert entry == canonical_entry(harness)
+        # sibling preserved
+        assert data_after.get("sibling") == {"b": 2}
+
+
+class TestInstallWithMalformedStringLeaf:
+    """Normal install on string leaf preserves siblings, errors on jev replacement."""
+
+    @pytest.mark.parametrize("harness", HARNESSES)
+    def test_project_scope(self, tmp_path: Path, harness: str) -> None:
+        project = _fixture_project(tmp_path, harness)
+        scopes = registration_target(harness).project
+        config_path = project / scopes.path_key
+        keys = scopes.server_path.split(".")
+        data: dict = {}
+        _BuildPath.set_leaf(data, keys, "corrupted")
+        data["keep"] = True
+        _write_json(config_path, data)
+
+        with pytest.raises(ValueError, match="Refusing to install"):
+            install_server(harness, project_root=project)
+
+        data_after = read_config(config_path, stop_root=project)
+        assert data_after.get("keep") is True
+
+
+class TestInstallWithMalformedListLeaf:
+    """Normal install on list leaf preserves siblings, errors on jev replacement."""
+
+    @pytest.mark.parametrize("harness", HARNESSES)
+    def test_project_scope(self, tmp_path: Path, harness: str) -> None:
+        project = _fixture_project(tmp_path, harness)
+        scopes = registration_target(harness).project
+        config_path = project / scopes.path_key
+        keys = scopes.server_path.split(".")
+        data: dict = {}
+        _BuildPath.set_leaf(data, keys, [1, 2])
+        data["sibling"] = {"x": "y"}
+        _write_json(config_path, data)
+
+        with pytest.raises(ValueError, match="Refusing to install"):
+            install_server(harness, project_root=project)
+
+        data_after = read_config(config_path, stop_root=project)
+        assert data_after.get("sibling") == {"x": "y"}
+
+    @pytest.mark.parametrize("harness", HARNESSES)
+    def test_force_replaces_only_jev(self, tmp_path: Path, harness: str) -> None:
+        project = _fixture_project(tmp_path, harness)
+        scopes = registration_target(harness).project
+        config_path = project / scopes.path_key
+        keys = scopes.server_path.split(".")
+        data: dict = {}
+        _BuildPath.set_leaf(data, keys, [1, 2])
+        data["sibling"] = {"x": "y"}
+        _write_json(config_path, data)
+
+        install_server(harness, project_root=project, force=True)
+
+        data_after = read_config(config_path, stop_root=project)
+        entry = data_after
+        for key in keys:
+            entry = entry[key]
+        assert entry == canonical_entry(harness)
+        assert data_after.get("sibling") == {"x": "y"}
+
+
+class TestInstallWithMalformedNonDictIntermediate:
+    """Normal install on non-dict intermediate preserves siblings, errors on jev replacement."""
+
+    @pytest.mark.parametrize("harness", HARNESSES)
+    def test_project_scope(self, tmp_path: Path, harness: str) -> None:
+        project = _fixture_project(tmp_path, harness)
+        scopes = registration_target(harness).project
+        config_path = project / scopes.path_key
+        keys = scopes.server_path.split(".")
+        if len(keys) <= 1:
+            pytest.skip("single-key path")
+        data: dict = {}
+        data[keys[0]] = {}  # first level is a dict (to be traversable)
+        data[keys[0]][keys[1]] = "corrupted"  # but the second key is non-dict
+        data["sibling"] = {"z": 0}
+        _write_json(config_path, data)
+
+        with pytest.raises(ValueError, match="Refusing to install"):
+            install_server(harness, project_root=project)
+
+        data_after = read_config(config_path, stop_root=project)
+        assert data_after.get("sibling") == {"z": 0}
+
+
+class TestInstallWithMalformedNullForce:
+    """Force install on null leaf replaces only jev, preserves siblings."""
+
+    @pytest.mark.parametrize("harness", HARNESSES)
+    def test_project_scope(self, tmp_path: Path, harness: str) -> None:
+        project = _fixture_project(tmp_path, harness)
+        scopes = registration_target(harness).project
+        config_path = project / scopes.path_key
+        keys = scopes.server_path.split(".")
+        data: dict = {}
+        _BuildPath.set_leaf(data, keys, None)
+        data["sibling"] = {"s": 1}
+        _write_json(config_path, data)
+
+        install_server(harness, project_root=project, force=True)
+
+        data_after = read_config(config_path, stop_root=project)
+        entry = data_after
+        for key in keys:
+            entry = entry[key]
+        assert entry == canonical_entry(harness)
+        assert data_after.get("sibling") == {"s": 1}
+
+
 # ── 4. Install ↔ Uninstall round-trip ──────────────────────────────
 
 
