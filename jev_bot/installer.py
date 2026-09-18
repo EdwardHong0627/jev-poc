@@ -124,9 +124,10 @@ def install_with_report(
 ) -> Tuple[Path, RegistrationResult]:
     """Install the JEV skill and MCP registration, returning the report.
 
-    Preflights both the skill source and the MCP configuration before any
-    filesystem mutation.  A failure in either domain leaves **no partial
-    state** (no skill directory, no MCP config change).
+    Preflights both the skill source and the skill target, then the MCP
+    configuration, before any filesystem mutation.  A failure in either
+    domain leaves **no partial state** (no skill directory, no MCP config
+    change).
 
     Returns a ``(skill_path, registration_result)`` tuple where *registration_*
     *result* describes the MCP registration outcome.
@@ -143,8 +144,7 @@ def install_with_report(
             "Exactly one of project_root or user_home must be provided"
         )
 
-    # Step 1: preflight skill source — must exist and be non-empty before
-    # any write, so a packaging issue cannot leave a half-written config.
+    # Step 1: preflight skill source — must exist and be non-empty.
     src_bytes = _read_skill_bytes()
     if not src_bytes:
         raise FileNotFoundError(f"SKILL.md is empty in package")
@@ -152,24 +152,24 @@ def install_with_report(
     project_suffix, user_suffix = HARNESS_MAP[harness]
 
     if project_root is not None:
-        project_path = _build_path(project_root, project_suffix) / SKILL_NAME
+        skill_path = _build_path(project_root, project_suffix) / SKILL_NAME
+        stop_root = project_root
     else:
-        user_path = _build_path(user_home, user_suffix) / SKILL_NAME  # type: ignore[unreachable]
+        skill_path = _build_path(user_home, user_suffix) / SKILL_NAME
+        stop_root = user_home
 
-    # Step 2: preflight MCP config — raises ValueError for foreign entry
+    # Step 2: preflight skill target — symlink checks, no mutation.
+    _preflight_skill_for_install(skill_path, stop_root)
+
+    # Step 3: preflight MCP config — raises ValueError for foreign entry
     # or malformed/symlinked config *before* we write anything.
     mcp_result = install_server(
         harness, project_root=project_root, user_home=user_home, force=force,
     )
 
-    # Step 3: write the skill (safe — both domains preflighted).
-    if project_root is not None:
-        _install_one(project_path, project_root, src_bytes, force)
-        return project_path / "SKILL.md", mcp_result
-
-    # user_home is not None here
-    _install_one(user_path, user_home, src_bytes, force)  # type: ignore[unreachable]
-    return user_path / "SKILL.md", mcp_result
+    # Step 4: write the skill (safe — both domains preflighted).
+    _install_one(skill_path, stop_root, src_bytes, force)
+    return skill_path / "SKILL.md", mcp_result
 
 
 
@@ -246,6 +246,17 @@ def uninstall_with_report(
 # ---------------------------------------------------------------------------
 # Install / Uninstall internals
 # ---------------------------------------------------------------------------
+
+
+def _preflight_skill_for_install(target: Path, stop_root: Path) -> None:
+    """Raise if the skill target path has unsafe symlink ancestry.
+
+    Read-only preflight: no files are created or modified.  Mirrors the
+    symlink check that ``_install_one`` performs, extracted so it can be
+    called **before** MCP config mutation.
+    """
+    # Check full symlink chain from target up to stop_root.
+    _find_symlink_ancestry(target, stop_root)
 
 
 def _preflight_skill_for_uninstall(target: Path, stop_root: Path) -> None:

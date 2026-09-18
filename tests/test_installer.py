@@ -1403,3 +1403,93 @@ class TestUninstallCanonicalAndSymlinkedSkillBothRegressed:
         canonical_after = json.loads(config_path.read_text())
         assert canonical_after == canonical_before
 
+
+
+# ---------------------------------------------------------------------------
+# 31. Install-side skill preflight — symlink fails before MCP mutation
+# ---------------------------------------------------------------------------
+
+
+class TestInstallPreflightsSymlinkedSkillPath:
+    """Install must raise before MCP mutation when the skill target is a symlink."""
+
+    def test_symlinked_skill_dir_blocks_mcp_creation(self, tmp_path: Path) -> None:
+        project = _fixture_dir(tmp_path, "symlink_skill_install")
+        _ensure_installer_dir(project)
+
+        # Create a symlink at the skill target path BEFORE calling install.
+        real_target = tmp_path / "real_skills"
+        real_target.mkdir()
+        skill_dir = _native_project_path("claude-code", project)
+        skill_dir.parent.mkdir(parents=True, exist_ok=True)
+        if skill_dir.exists():
+            if skill_dir.is_dir():
+                shutil.rmtree(skill_dir)
+            else:
+                skill_dir.unlink()
+        skill_dir.symlink_to(real_target)
+
+        config_path = project / ".mcp.json"
+
+        with pytest.raises(RuntimeError, match="symlink"):
+            install("claude-code", project_root=project)
+
+        # MCP config must NOT have been created.
+        assert not config_path.exists()
+
+    def test_symlinked_skill_parent_blocks_mcp_creation(self, tmp_path: Path) -> None:
+        """Symlinked parent directory (e.g. .claude/skills is a symlink) blocks install."""
+        project = _fixture_dir(tmp_path, "symlink_parent_install")
+        _ensure_installer_dir(project)
+
+        # Create .claude/skills as a symlink.
+        real_skills = tmp_path / "real_skills_parent"
+        real_skills.mkdir()
+        skills_dir = project / ".claude" / "skills"
+        skills_dir.mkdir(parents=True, exist_ok=True)
+        if skills_dir.is_dir():
+            shutil.rmtree(skills_dir)
+        skills_dir.symlink_to(real_skills)
+
+        config_path = project / ".mcp.json"
+
+        with pytest.raises(RuntimeError, match="symlink"):
+            install("claude-code", project_root=project)
+
+        # MCP config must NOT have been created.
+        assert not config_path.exists()
+
+
+class TestInstallPreservesExistingMCPConfig:
+    """Install must not mutate an existing MCP config when skill preflight fails."""
+
+    def test_foreign_mcp_preserved_when_skill_symlink_fails(self, tmp_path: Path) -> None:
+        """If both skill is symlinked AND MCP config has a foreign entry,
+        install must fail without touching the config."""
+        project = _fixture_dir(tmp_path, "dual_symlink_foreign")
+        _ensure_installer_dir(project)
+
+        config_path = project / ".mcp.json"
+        config_path.write_text(
+            json.dumps({"mcpServers": {"jev": {"type": "websocket", "url": "http://x"}}}),
+            encoding="utf-8",
+        )
+
+        real_target = tmp_path / "real_skill"
+        real_target.mkdir()
+        skill_dir = _native_project_path("claude-code", project)
+        skill_dir.parent.mkdir(parents=True, exist_ok=True)
+        if skill_dir.exists():
+            if skill_dir.is_dir():
+                shutil.rmtree(skill_dir)
+            else:
+                skill_dir.unlink()
+        skill_dir.symlink_to(real_target)
+
+        with pytest.raises(RuntimeError, match="symlink"):
+            install("claude-code", project_root=project)
+
+        # Foreign MCP config unchanged.
+        data = json.loads(config_path.read_text())
+        assert data["mcpServers"]["jev"]["type"] == "websocket"
+
