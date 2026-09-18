@@ -65,7 +65,7 @@ On process exit (normal or via `Ctrl-C`):
 1. Close the `sqlite3.Connection` (which flushes and closes the file).
 2. The existing `DecisionsClient.close()` lifecycle continues after the database close.
 
-No WAL checkpoint or `PRAGMA wal_checkpoint(FULL)` is required; `connection.close()` is sufficient to ensure durability on POSIX systems with journal mode `delete` (the default).
+No WAL checkpoint or `PRAGMA wal_checkpoint(FULL)` is required; `connection.close()` is sufficient to ensure durability on POSIX systems with journal mode `delete` (the default). The connection is closed only after the server transport exits.
 
 ## 4. Recorder component
 
@@ -87,28 +87,32 @@ class Recorder:
 | Column | Type | Constraint | Description |
 |---|---|---|---|
 | `id` | `INTEGER` | `PRIMARY KEY AUTOINCREMENT` | Monotonically increasing row identifier. Not logged to any external system. |
-| `timestamp` | `TEXT` | `NOT NULL` | ISO 8601 UTC timestamp: `datetime.utcnow().isoformat()` produces e.g. `"2026-09-19T12:34:56.789000"`. |
-| `request` | `TEXT` | `NOT NULL` | The **validated** request dict, serialized to compact JSON (`json.dumps(..., separators=(',', ':'))`). |
-| `response` | `TEXT` | `NOT NULL` | The **shaped** response dict (`{"answers": ...}`), serialized with the same compact separators. |
+| `timestamp` | `TEXT` | `NOT NULL` | ISO 8601 UTC timestamp: `datetime.now(timezone.utc).isoformat()` produces e.g. `"2026-09-19T12:34:56.789000+00:00"`. |
+| `request` | `TEXT` | `NOT NULL` | The **validated** request dict, serialized with `json.dumps(value, separators=(',', ':'), ensure_ascii=False, sort_keys=True)`. |
+| `response` | `TEXT` | `NOT NULL` | The **shaped** response dict (`{"answers": ...}`), serialized with `json.dumps(value, separators=(',', ':'), ensure_ascii=False, sort_keys=True)`. |
 
 No other columns, indexes, or triggers exist.
 
 ### 4.3 JSON fidelity
 
-- **Serialisation:** `json.dumps(value, separators=(',', ':'))` — no indentation, no trailing whitespace.
-- **Unicode:** `json.dumps(..., ensure_ascii=False)` — the raw Unicode from the request (`state`, `instructions`, criteria strings) is preserved without escape.
-- **Key ordering:** `json.dumps(..., sort_keys=True)` — alphabetical key ordering guarantees deterministic, byte-identical output for semantically equal requests/responses.
-- **Round-trip guarantee:** `json.loads(serialized) == value` for every value that is JSON-serialisable (dict, str, float, int, bool, None, list). If `json.dumps` raises `TypeError`, the row is **not** written (see §7).
+Every call to `Recorder.log()` serialises request and response dicts with the **same** call:
 
-These three flags (`separators`, `ensure_ascii`, `sort_keys`) are applied on every call to `Recorder.log()`.
+```python
+json.dumps(value, separators=(',', ':'), ensure_ascii=False, sort_keys=True)
+```
+
+- **Compact format:** `separators=(',', ':')` — no indentation, no trailing whitespace.
+- **Unicode:** `ensure_ascii=False` — the raw Unicode from the request (`state`, `instructions`, criteria strings) is preserved without escape.
+- **Deterministic ordering:** `sort_keys=True` — alphabetical key ordering guarantees byte-identical output for semantically equal requests/responses.
+- **Round-trip guarantee:** `json.loads(serialized) == value` for every value that is JSON-serialisable (dict, str, float, int, bool, None, list). If `json.dumps` raises `TypeError`, the row is **not** written and an error is raised (§4.4).
 
 ### 4.4 No partial rows
 
-A row is written only when the entire `INSERT` completes within the transaction. If serialisation fails or the `INSERT` fails for any reason:
+A row is written only when the entire `INSERT` commits within the transaction. If serialisation fails or the `INSERT` fails for any reason:
 
 - The row is **not** created.
-- The failure is converted to a `DecisionsError` with a message starting with `"[storage]"` (see §7).
-- The tool call **still succeeds** and returns the shaped response to the caller — the error is only that persistence failed.
+- The failure is converted to a sanitized MCP error with a message starting with `"[storage]"` (see §6).
+- **No successful response is returned** — the tool call fails with the sanitized error.
 
 ## 5. Integration with the MCP tool handler
 
@@ -128,7 +132,7 @@ When `recorder` is `None` (default, unconfigured), the tool handler omits the lo
 
 ### 5.2 Placement in the tool handler
 
-The log step is placed **after** the response is fully shaped and **inside** the existing function scope that owns the `answers` dict:
+The log step is placed **after** the response is fully shaped and **before** the response is returned, so the row is committed (or an error raised) prior to returning success:
 
 ```
 validate input
@@ -139,17 +143,28 @@ validate input
     → return {"answers": ...}
 ```
 
-The recorder is called from the **async tool handler**, so it MUST be executed via `asyncio.to_thread()` to avoid blocking the MCP event loop. The recorder itself is synchronous — it issues `INSERT` on the connection, which may block on I/O.
+The recorder is called from the **async tool handler**, so it MUST be executed via `asyncio.to_thread()` to avoid blocking the MCP event loop. The recorder itself is synchronous — it issues the `INSERT` within a lock-guarded transaction.
 
 ### 5.3 Thread safety
 
-- The `sqlite3.Connection` is opened with `check_same_thread=False`.
-- `Recorder.log()` performs a single `INSERT ... VALUES (?, ?, ?, ?)` within `connection.execute(...)` calls wrapped in the default autocommit context (or explicitly via a `try/finally` + `connection.commit()` / `connection.rollback()`).
-- SQLite journal mode defaults to `delete` (not WAL). With `check_same_thread=False` and a single writer, concurrent `INSERT`s from different tool-invocation threads are serialized by SQLite's internal `INSERT` lock. No additional application-level locking is required because:
-  - Each `INSERT` is a single statement.
-  - No `SELECT` or `UPDATE` queries exist.
-  - `check_same_thread=False` is sufficient for the SQLite C-level mutex.
-- Should the `INSERT` raise `sqlite3.IntegrityError` (e.g. corrupted database), the error is caught, sanitised, and treated as a storage failure (§7).
+- The `sqlite3.Connection` is opened **once** at startup with `check_same_thread=False` and guarded by a single `threading.Lock` shared by all `Recorder` instances.
+- `Recorder.log()` acquires the lock, begins an explicit transaction (`BEGIN`), executes the `INSERT`, then either `COMMIT` or `ROLLBACK` within a `try/finally` block:
+
+  ```python
+  with self._lock:
+      try:
+          self._connection.execute(
+              "INSERT INTO investigations (timestamp, request, response) VALUES (?, ?, ?)",
+              (timestamp, request_json, response_json),
+          )
+          self._connection.commit()
+      except Exception:
+          self._connection.rollback()
+          raise
+  ```
+
+- The lock serialises all concurrent log invocations across worker threads. No additional SQLite-level tuning is required because each `INSERT` is a single statement, and there are no `SELECT` or `UPDATE` queries.
+- Should the `INSERT` raise `sqlite3.IntegrityError` (e.g. corrupted database), the error is caught, sanitised, and re-raised as a storage failure (§6).
 
 ### 5.4 No storage of failures
 
@@ -159,8 +174,7 @@ The log step is reached **only after** `client.decide()` returns successfully **
 - Transport errors from `client.decide()`.
 - HTTP non-2xx, malformed JSON, or `DecisionsError` from the API.
 - Shaping errors (unexpected answer types, missing keys).
-- Response serialisation failures (handled as storage errors).
-- Any storage errors during the `INSERT`.
+- Any failure during the log step itself — these are handled as storage errors that prevent a successful response.
 
 ## 6. Storage error sanitization
 
@@ -184,7 +198,7 @@ Example:
 - Original: `sqlite3.OperationalError: disk full`
 - Sanitised: `[storage] Investigation log: OperationalError: disk full`
 
-The tool **returns the shaped response** to the caller — the storage failure does not suppress the decision result.
+**No successful response is returned.** The tool call fails with the sanitized error. The absence of a row in the database is the observable consequence of the failure.
 
 ## 7. Lifecycle and concurrency
 
@@ -196,15 +210,20 @@ The tool **returns the shaped response** to the caller — the storage failure d
 
 ### 7.2 Concurrent invocations
 
-The MCP server handles tool calls sequentially on a single process (no inter-process concurrency). However, within a single process, async tool handlers for `jev_decide` may be queued. The `check_same_thread=False` setting allows the `Recorder.log()` call — dispatched via `asyncio.to_thread()` — to proceed on the worker thread. SQLite's C-level mutex serialises the writes.
+The MCP server handles tool calls sequentially on a single process (no inter-process concurrency). Within a single process, async tool handlers for `jev_decide` may be dispatched to multiple worker threads via `asyncio.to_thread()`. Concurrency is safe because:
+
+- A single `threading.Lock` serialises all calls to `Recorder.log()`, ensuring only one `INSERT` + `COMMIT`/`ROLLBACK` executes at a time.
+- The `sqlite3.Connection` is opened with `check_same_thread=False`, but the lock is the authoritative concurrency guard.
+- No additional application-level locking is required because each `INSERT` is a single statement and there are no `SELECT` or `UPDATE` queries.
 
 ### 7.3 Crash safety
 
 On unclean shutdown (SIGKILL, OOM):
 
 - SQLite's default `delete` journal mode provides crash safety: the uncommitted transaction is discarded on recovery.
-- Because each `INSERT` is its own implicit transaction, at most one row may be lost (the one in-flight during the crash).
+- Because each `INSERT` is its own explicit transaction, at most one row may be lost (the one in-flight during the crash).
 - No explicit `PRAGMA synchronous` tuning is performed (defaults to `FULL`).
+- If a crash occurs mid-`INSERT`, the transaction is rolled back on recovery and no partial row is written (§4.4).
 
 ## 8. File location contract
 
@@ -223,7 +242,7 @@ On unclean shutdown (SIGKILL, OOM):
 | 5 | JSON serialisation is deterministic (sorted keys, compact separators, no ASCII escaping). | Two identical calls produce byte-identical `request` and `response` columns. |
 | 6 | Validation failures do not create rows. | Call with invalid input (blank `state`); verify row count is still 0. |
 | 7 | API/client errors do not create rows. | Inject a failing fake client; call the tool; verify row count is still 0. |
-| 8 | Storage errors do not suppress the response. | Corrupt the database *after* the table exists; call the tool successfully; verify the response is returned (with a storage `DecisionsError` in the tool output). |
+| 8 | Storage errors fail the call and create no row. | Corrupt the database *after* the table exists; call the tool successfully (upstream succeeds); verify the call fails with a `[storage]` error and no row was written. |
 | 9 | Parent-does-not-exist exits with error, no file created. | Start with `--sqlite-db /nonexistent/path/db.sqlite`; verify exit code 1 and no file at `/nonexistent`. |
 | 10 | A database from a previous run is safe to reopen (`IF NOT EXISTS`). | Stop server after writing rows; restart with same `--sqlite-db` path; verify previous rows are still present and new writes append. |
 | 11 | Shutdown closes the database cleanly. | Start with `--sqlite-db`; send SIGTERM; verify no `sqlite3.OperationalError` on shutdown. |
