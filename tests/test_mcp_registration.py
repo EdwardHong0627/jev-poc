@@ -6,6 +6,7 @@ import pytest
 
 from jev_bot.mcp_registration import (
     HARNESSES,
+    JEV_GIT_URL,
     REGISTRY,
     ScopeSpec,
     Scopes,
@@ -294,3 +295,91 @@ class TestSpecificPathKeys:
     def test_pi_user_path_key(self) -> None:
         spec = REGISTRY["pi"]
         assert spec.scopes.user.path_key == ".pi/agent/mcp.json"
+
+
+# ── JEV_GIT_URL constant ────────────────────────────────────────────
+
+def test_git_url_is_correct_repository() -> None:
+    assert JEV_GIT_URL == "git+https://github.com/EdwardHong0627/jev-poc.git"
+
+
+def test_git_url_used_in_claude_code_entry() -> None:
+    entry = canonical_entry("claude-code")
+    assert JEV_GIT_URL in entry["args"]
+
+
+def test_git_url_used_in_opencode_entry() -> None:
+    entry = canonical_entry("opencode")
+    assert JEV_GIT_URL in entry["command"]
+
+
+def test_git_url_used_in_oh_my_pi_entry() -> None:
+    entry = canonical_entry("oh-my-pi")
+    assert JEV_GIT_URL in entry["args"]
+
+
+def test_git_url_used_in_pi_entry() -> None:
+    entry = canonical_entry("pi")
+    assert JEV_GIT_URL in entry["args"]
+
+
+# ── server_path ──────────────────────────────────────────────────────
+
+class TestServerPath:
+    """Assert that every ScopeSpec has a declarative server_path ending in 'jev'."""
+
+    def test_all_scope_specs_have_server_path(self) -> None:
+        for harness in HARNESSES:
+            spec = REGISTRY[harness]
+            assert spec.scopes.project.server_path == "jev"
+            assert spec.scopes.user.server_path == "jev"
+
+    def test_claude_code_project_server_path(self) -> None:
+        spec = REGISTRY["claude-code"]
+        assert spec.scopes.project.server_path == "jev"
+
+    def test_claude_code_user_server_path(self) -> None:
+        spec = REGISTRY["claude-code"]
+        assert spec.scopes.user.server_path == "jev"
+
+    def test_opencode_project_server_path(self) -> None:
+        spec = REGISTRY["opencode"]
+        assert spec.scopes.project.server_path == "jev"
+
+    def test_opencode_user_server_path(self) -> None:
+        spec = REGISTRY["opencode"]
+        assert spec.scopes.user.server_path == "jev"
+
+    def test_oh_my_pi_project_server_path(self) -> None:
+        spec = REGISTRY["oh-my-pi"]
+        assert spec.scopes.project.server_path == "jev"
+
+    def test_oh_my_pi_user_server_path(self) -> None:
+        spec = REGISTRY["oh-my-pi"]
+        assert spec.scopes.user.server_path == "jev"
+
+    def test_pi_project_server_path(self) -> None:
+        spec = REGISTRY["pi"]
+        assert spec.scopes.project.server_path == "jev"
+
+    def test_pi_user_server_path(self) -> None:
+        spec = REGISTRY["pi"]
+        assert spec.scopes.user.server_path == "jev"
+
+
+class TestRegistrationTargetServerPath:
+    """Assert server_path is reachable through registration_target()."""
+
+    def test_project_server_path_via_registration_target(self) -> None:
+        scopes = registration_target("claude-code")
+        assert scopes.project.server_path == "jev"
+
+    def test_user_server_path_via_registration_target(self) -> None:
+        scopes = registration_target("opencode")
+        assert scopes.user.server_path == "jev"
+
+    def test_all_harnesses_server_path_via_registration_target(self) -> None:
+        for harness in HARNESSES:
+            scopes = registration_target(harness)
+            assert scopes.project.server_path == "jev"
+            assert scopes.user.server_path == "jev"

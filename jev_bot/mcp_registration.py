@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-JEV_GIT_URL = "git+https://github.com/nicktate0/jev-mcp"
+JEV_GIT_URL = "git+https://github.com/EdwardHong0627/jev-poc.git"
 
 
 @dataclass(frozen=True, slots=True)
@@ -18,6 +18,7 @@ class ScopeSpec:
     """Path keys for a single scope (project or user) of a harness."""
 
     path_key: str
+    server_path: str  # basename of the "jev" server key within the config file
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,26 +75,26 @@ HARNESSES: list[str] = [
 REGISTRY: dict[str, HarnessSpec] = {
     "claude-code": HarnessSpec(
         scopes=Scopes(
-            project=ScopeSpec(path_key=".mcp.json"),
-            user=ScopeSpec(path_key=".claude.json"),
+            project=ScopeSpec(path_key=".mcp.json", server_path="jev"),
+            user=ScopeSpec(path_key=".claude.json", server_path="jev"),
         ),
     ),
     "opencode": HarnessSpec(
         scopes=Scopes(
-            project=ScopeSpec(path_key="opencode.json"),
-            user=ScopeSpec(path_key=".config/opencode/opencode.json"),
+            project=ScopeSpec(path_key="opencode.json", server_path="jev"),
+            user=ScopeSpec(path_key=".config/opencode/opencode.json", server_path="jev"),
         ),
     ),
     "oh-my-pi": HarnessSpec(
         scopes=Scopes(
-            project=ScopeSpec(path_key=".omp/mcp.json"),
-            user=ScopeSpec(path_key=".omp/agent/mcp.json"),
+            project=ScopeSpec(path_key=".omp/mcp.json", server_path="jev"),
+            user=ScopeSpec(path_key=".omp/agent/mcp.json", server_path="jev"),
         ),
     ),
     "pi": HarnessSpec(
         scopes=Scopes(
-            project=ScopeSpec(path_key=".pi/mcp.json"),
-            user=ScopeSpec(path_key=".pi/agent/mcp.json"),
+            project=ScopeSpec(path_key=".pi/mcp.json", server_path="jev"),
+            user=ScopeSpec(path_key=".pi/agent/mcp.json", server_path="jev"),
         ),
     ),
 }
