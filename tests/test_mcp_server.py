@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import sqlite3
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -15,6 +18,7 @@ from jev_bot.models import JEVRequest, JEVResponse, NoulResult
 MODEL_ID = "~typesafe/jev-latest"
 
 from jev_mcp.server import (
+    Recorder,
     _build_decide_tool,
     _known_question_fields,
     _redact_sensitive,
@@ -1122,4 +1126,44 @@ class TestOutputTypeConfidence:
         assert result["answers"]["q"]["type"] == "score"
         assert result["answers"]["q"]["confidence"] == 0.6
         assert result["answers"]["q"]["score"] == 5.0
+
+
+class TestSQLiteInvestigationLogging:
+    def test_successful_batch_is_stored_as_one_request_response_row(
+        self, tmp_path: Path
+    ) -> None:
+        connection = sqlite3.connect(
+            tmp_path / "investigations.sqlite3", check_same_thread=False
+        )
+        connection.execute(
+            "CREATE TABLE investigations ("
+            "id INTEGER PRIMARY KEY, timestamp TEXT, request TEXT, response TEXT)"
+        )
+        recorder = Recorder(connection)
+        client = _make_fake(
+            decide_returns={
+                "answers": {
+                    "first": {"type": "noul", "noul": 0.2},
+                    "second": {"type": "noul", "noul": 0.8},
+                }
+            }
+        )
+        tool = _build_decide_tool(client, FAKE_CONFIG, recorder=recorder)
+
+        result = asyncio.run(
+            tool(
+                state="batch decision",
+                questions={
+                    "first": {"type": "noul", "instructions": "First"},
+                    "second": {"type": "noul", "instructions": "Second"},
+                },
+            )
+        )
+
+        rows = connection.execute(
+            "SELECT request, response FROM investigations"
+        ).fetchall()
+        assert len(rows) == 1
+        assert json.loads(rows[0][0])["questions"].keys() == {"first", "second"}
+        assert json.loads(rows[0][1]) == result
 

@@ -155,3 +155,17 @@ MCP output includes `type` and `confidence` on each answer entry.
 `choice` results always include `confidence`; `score` results always include
 `confidence`; `noul` results include `confidence` only when the API provides
 it.
+
+### Investigation logging
+
+To retain successful MCP requests and responses for later investigation, opt in
+with an explicit database path:
+
+```sh
+uv run python -m jev_mcp.server --sqlite-db ./investigations.sqlite3
+```
+
+Each successful `jev_decide` call, including a batch of questions, appends one
+row containing its UTC timestamp, validated request, and shaped response.
+Omit `--sqlite-db` to disable logging. Validation, API, response-shaping, and
+storage failures are never recorded.
