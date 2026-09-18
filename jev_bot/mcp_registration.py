@@ -143,35 +143,50 @@ def canonical_entry(harness: str) -> dict:
 # ── Config read / write helpers (Task 2) ──────────────────────────────
 
 
-def _reject_symlink(path: Path) -> None:
-    """Raise ``ValueError`` if *path* or any of its parents (up to the
-    selected project/user root) is a symlink.
+def _find_symlink_ancestry(path: Path, stop_root: Path) -> None:
+    """Walk from *path* up toward *stop_root*, raising if any existing
+    component is a symlink.
 
-    The check walks the resolved path *backwards* so that a symlinked
-    ancestor directory is also refused even when the final component is
-    a real file.
+    Mirrors the installer strategy: only inspect components that
+    actually exist on disk, never walk past *stop_root*.
     """
-    # Walk from the file itself up through every parent component.
-    # Stop at the root of the filesystem (no more parents).
-    for component in path.parents:
+    cur: Path = path
+    visited: list[Path] = []
+    while cur != stop_root and cur != cur.parent:
+        if cur.exists():
+            visited.append(cur)
+        cur = cur.parent
+
+    for component in reversed(visited):
         if component.is_symlink():
             raise ValueError(
                 f"Refusing config path through symlink: {component}"
             )
+
+
+def _reject_symlink(path: Path, stop_root: Path) -> None:
+    """Refuse *path* or any ancestor (up to *stop_root*) that is a symlink.
+
+    The walk stops at *stop_root* (which is considered trusted).
+    """
+    _find_symlink_ancestry(path, stop_root)
     if path.is_symlink():
         raise ValueError(
             f"Refusing config path: {path} is a symlink"
         )
 
 
-def read_config(path: Path) -> dict:
+def read_config(path: Path, *, stop_root: Path) -> dict:
     """Read and parse a JSON config file.
+
+    *stop_root* is the trusted boundary (project root or user home); the
+    symlink walk stops there and never reaches filesystem root.
 
     Returns an empty dict ``{}`` when the file does not exist.
     Raises ``ValueError`` when the file is malformed or the top-level
     JSON value is not an object.
     """
-    _reject_symlink(path)
+    _reject_symlink(path, stop_root)
 
     if not path.exists():
         return {}
@@ -196,17 +211,19 @@ def read_config(path: Path) -> dict:
     return data
 
 
-def write_config_atomic(path: Path, value: dict) -> None:
+def write_config_atomic(path: Path, value: dict, *, stop_root: Path) -> None:
     """Write *value* as UTF-8 JSON to *path* atomically.
 
-    Creates parent directories as needed.  Writes to a temporary file
-    in the same directory, fsyncs it, and replaces the target via
+    Creates parent directories as needed.  Opens the temp file with
+    ``os.fdopen``, calls ``json.dump``, ``fsync``, then
     ``os.replace`` (no pre-deletion of the target).
 
-    Raises ``ValueError`` if *path* or any ancestor component (up to
-    the chosen project/user root) is a symlink.
+    *stop_root* is the trusted boundary; the symlink walk stops there.
+
+    Raises ``ValueError`` if *path* or any ancestor (up to *stop_root*)
+    is a symlink.
     """
-    _reject_symlink(path)
+    _reject_symlink(path, stop_root)
 
     parent = path.parent
     if parent and not parent.exists():
@@ -214,14 +231,12 @@ def write_config_atomic(path: Path, value: dict) -> None:
 
     fd, tmp_path = tempfile.mkstemp(dir=str(parent), suffix=".tmp")
     try:
-        os.write(fd, json.dumps(value, indent=2).encode("utf-8"))
-        os.fsync(fd)
-        os.close(fd)
-        fd = -1  # already closed
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(value, fh, indent=2)
+            fh.flush()
+            os.fsync(fh.fileno())
         os.replace(tmp_path, str(path))
     except BaseException:
-        if fd >= 0:
-            os.close(fd)
         try:
             os.unlink(tmp_path)
         except OSError:

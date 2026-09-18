@@ -475,33 +475,36 @@ class TestReadConfigMissing:
         from jev_bot.mcp_registration import read_config
 
         missing = tmp_path / "no_such_file.json"
-        result = read_config(missing)
+        stop_root = tmp_path
+        result = read_config(missing, stop_root=stop_root)
         assert result == {}
         assert isinstance(result, dict)
 
 
 class TestReadConfigValidJson:
-    """read_config round-trips valid JSON objects."""
+    """read_config round-trips valid JSON objects through stop_root."""
 
     def test_roundtrip_single_key(self, tmp_path) -> None:
         from jev_bot.mcp_registration import read_config, write_config_atomic
 
         target = tmp_path / "config.json"
+        stop_root = tmp_path
         original = {"mcpServers": {"jeo": {"type": "stdio"}}}
-        write_config_atomic(target, original)
-        result = read_config(target)
+        write_config_atomic(target, original, stop_root=stop_root)
+        result = read_config(target, stop_root=stop_root)
         assert result == original
 
     def test_preserves_nested_structure(self, tmp_path) -> None:
         from jev_bot.mcp_registration import read_config, write_config_atomic
 
         target = tmp_path / "nested.json"
+        stop_root = tmp_path
         original = {
             "outer": {"inner": {"deep": 42, "list": [1, 2, 3]}},
             "top": "value",
         }
-        write_config_atomic(target, original)
-        result = read_config(target)
+        write_config_atomic(target, original, stop_root=stop_root)
+        result = read_config(target, stop_root=stop_root)
         assert result["outer"]["inner"]["deep"] == 42
         assert result["outer"]["inner"]["list"] == [1, 2, 3]
         assert result["top"] == "value"
@@ -510,9 +513,10 @@ class TestReadConfigValidJson:
         from jev_bot.mcp_registration import read_config, write_config_atomic
 
         target = tmp_path / "empty.json"
+        stop_root = tmp_path
         original: dict = {}
-        write_config_atomic(target, original)
-        result = read_config(target)
+        write_config_atomic(target, original, stop_root=stop_root)
+        result = read_config(target, stop_root=stop_root)
         assert result == {}
 
 
@@ -523,51 +527,57 @@ class TestReadConfigMalformed:
         from jev_bot.mcp_registration import read_config
 
         target = tmp_path / "array.json"
+        stop_root = tmp_path
         target.write_text("[1, 2, 3]", encoding="utf-8")
         with pytest.raises(ValueError, match="must be a JSON object"):
-            read_config(target)
+            read_config(target, stop_root=stop_root)
 
     def test_raises_on_string_json(self, tmp_path) -> None:
         from jev_bot.mcp_registration import read_config
 
         target = tmp_path / "string.json"
+        stop_root = tmp_path
         target.write_text('"hello"', encoding="utf-8")
         with pytest.raises(ValueError, match="must be a JSON object"):
-            read_config(target)
+            read_config(target, stop_root=stop_root)
 
     def test_raises_on_number_json(self, tmp_path) -> None:
         from jev_bot.mcp_registration import read_config
 
         target = tmp_path / "number.json"
+        stop_root = tmp_path
         target.write_text("42", encoding="utf-8")
         with pytest.raises(ValueError, match="must be a JSON object"):
-            read_config(target)
+            read_config(target, stop_root=stop_root)
 
     def test_raises_on_null_json(self, tmp_path) -> None:
         from jev_bot.mcp_registration import read_config
 
         target = tmp_path / "null.json"
+        stop_root = tmp_path
         target.write_text("null", encoding="utf-8")
         with pytest.raises(ValueError, match="must be a JSON object"):
-            read_config(target)
+            read_config(target, stop_root=stop_root)
 
     def test_raises_on_invalid_json(self, tmp_path) -> None:
         from jev_bot.mcp_registration import read_config
 
         target = tmp_path / "invalid.json"
+        stop_root = tmp_path
         target.write_text("{broken json!!!", encoding="utf-8")
         with pytest.raises(ValueError):
-            read_config(target)
+            read_config(target, stop_root=stop_root)
 
 
 class TestWriteConfigAtomic:
-    """write_config_atomic creates dirs, writes, and replaces atomically."""
+    """write_config_atomic creates dirs, writes via fdopen+json.dump, and replaces atomically."""
 
     def test_creates_parent_directory(self, tmp_path) -> None:
         from jev_bot.mcp_registration import write_config_atomic
 
         target = tmp_path / "a" / "b" / "config.json"
-        write_config_atomic(target, {"key": "val"})
+        stop_root = tmp_path
+        write_config_atomic(target, {"key": "val"}, stop_root=stop_root)
         assert target.exists()
 
     def test_uses_os_replace_not_pre_delete(self, tmp_path) -> None:
@@ -577,9 +587,10 @@ class TestWriteConfigAtomic:
 
         target = tmp_path / "existing.json"
         target.write_text("old content", encoding="utf-8")
+        stop_root = tmp_path
         old_stat = target.stat()
 
-        write_config_atomic(target, {"new": "data"})
+        write_config_atomic(target, {"new": "data"}, stop_root=stop_root)
 
         # File should still exist
         assert target.exists()
@@ -590,7 +601,8 @@ class TestWriteConfigAtomic:
         from jev_bot.mcp_registration import write_config_atomic
 
         target = tmp_path / "utf8.json"
-        write_config_atomic(target, {"emoji": "hello"})
+        stop_root = tmp_path
+        write_config_atomic(target, {"emoji": "hello"}, stop_root=stop_root)
         content = target.read_text(encoding="utf-8")
         assert content  # non-empty
 
@@ -599,14 +611,37 @@ class TestWriteConfigAtomic:
         from jev_bot.mcp_registration import read_config, write_config_atomic
 
         target = tmp_path / "valid.json"
-        write_config_atomic(target, {"check": True})
+        stop_root = tmp_path
+        write_config_atomic(target, {"check": True}, stop_root=stop_root)
         with open(target, "r", encoding="utf-8") as fh:
             parsed = json.load(fh)
         assert parsed == {"check": True}
 
+    def test_uses_fdopen_not_raw_write(self, tmp_path) -> None:
+        """write_config_atomic must use os.fdopen + json.dump (not os.write)."""
+        import inspect
+        from jev_bot.mcp_registration import write_config_atomic
+
+        source = inspect.getsource(write_config_atomic)
+        assert "os.fdopen" in source, "Must use os.fdopen for write"
+        assert "json.dump" in source, "Must use json.dump for serialization"
+
+    def test_fdopen_handles_unicode(self, tmp_path) -> None:
+        """fdopen write handles full Unicode (emoji, CJK) without encode/decode roundtrip issues."""
+        from jev_bot.mcp_registration import read_config, write_config_atomic
+
+        target = tmp_path / "unicode.json"
+        stop_root = tmp_path
+        original = {"emoji": "😀", "cjk": "日本語", "arabic": "مرحبا"}
+        write_config_atomic(target, original, stop_root=stop_root)
+        result = read_config(target, stop_root=stop_root)
+        assert result["emoji"] == "😀"
+        assert result["cjk"] == "日本語"
+        assert result["arabic"] == "مرحبا"
+
 
 class TestSymlinkRefusal:
-    """read_config and write_config_atomic refuse symlinked targets."""
+    """read_config and write_config_atomic refuse symlinked targets within stop_root."""
 
     def test_read_config_refuses_symlinked_file(self, tmp_path) -> None:
         from jev_bot.mcp_registration import read_config
@@ -615,10 +650,11 @@ class TestSymlinkRefusal:
         real.write_text("{}", encoding="utf-8")
         link = tmp_path / "link.json"
         link.symlink_to(real)
+        stop_root = tmp_path
         with pytest.raises(ValueError, match="symlink"):
-            read_config(link)
+            read_config(link, stop_root=stop_root)
 
-    def test_read_config_refuses_symlinked_ancestor(self, tmp_path) -> None:
+    def test_read_config_refuses_symlinked_ancestor_within_root(self, tmp_path) -> None:
         from jev_bot.mcp_registration import read_config
 
         base = tmp_path / "realdir"
@@ -626,8 +662,9 @@ class TestSymlinkRefusal:
         link_dir = tmp_path / "linkdir"
         link_dir.symlink_to(base)
         target = link_dir / "config.json"
+        stop_root = tmp_path
         with pytest.raises(ValueError, match="symlink"):
-            read_config(target)
+            read_config(target, stop_root=stop_root)
 
     def test_write_config_refuses_symlinked_file(self, tmp_path) -> None:
         from jev_bot.mcp_registration import write_config_atomic
@@ -636,10 +673,11 @@ class TestSymlinkRefusal:
         real.write_text("{}", encoding="utf-8")
         link = tmp_path / "link.json"
         link.symlink_to(real)
+        stop_root = tmp_path
         with pytest.raises(ValueError, match="symlink"):
-            write_config_atomic(link, {"boom": True})
+            write_config_atomic(link, {"boom": True}, stop_root=stop_root)
 
-    def test_write_config_refuses_symlinked_ancestor(self, tmp_path) -> None:
+    def test_write_config_refuses_symlinked_ancestor_within_root(self, tmp_path) -> None:
         from jev_bot.mcp_registration import write_config_atomic
 
         base = tmp_path / "realdir"
@@ -647,5 +685,50 @@ class TestSymlinkRefusal:
         link_dir = tmp_path / "linkdir"
         link_dir.symlink_to(base)
         target = link_dir / "config.json"
+        stop_root = tmp_path
         with pytest.raises(ValueError, match="symlink"):
-            write_config_atomic(target, {"boom": True})
+            write_config_atomic(target, {"boom": True}, stop_root=stop_root)
+
+
+class TestStopRootBound:
+    """stop_root limits the symlink walk — legitimate config under a deep
+    tmp path works, symlink inside the allowed subtree is still caught."""
+
+    def test_legitimate_deep_path_works(self, tmp_path) -> None:
+        """A real nested config under tmp_path with tmp_path as stop_root."""
+        from jev_bot.mcp_registration import read_config, write_config_atomic
+
+        real = tmp_path / "a" / "b" / "c" / "config.json"
+        stop_root = tmp_path
+        write_config_atomic(real, {"ok": True}, stop_root=stop_root)
+        result = read_config(real, stop_root=stop_root)
+        assert result == {"ok": True}
+
+    def test_symlink_target_outside_stop_root_is_not_accessed(self, tmp_path) -> None:
+        """A symlink whose target lies outside stop_root must be refused."""
+        from jev_bot.mcp_registration import read_config, write_config_atomic
+
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        safe_dir = tmp_path / "safe"
+        safe_dir.mkdir()
+        real_file = outside / "real.json"
+        real_file.write_text("{}", encoding="utf-8")
+        link = safe_dir / "link.json"
+        link.symlink_to(real_file)
+        stop_root = tmp_path
+        with pytest.raises(ValueError, match="symlink"):
+            read_config(link, stop_root=stop_root)
+
+    def test_symlink_in_ancestor_inside_root_is_caught(self, tmp_path) -> None:
+        """A symlinked parent dir inside stop_root must be refused."""
+        from jev_bot.mcp_registration import read_config
+
+        real_dir = tmp_path / "real_parent"
+        real_dir.mkdir()
+        link_parent = tmp_path / "fake_parent"
+        link_parent.symlink_to(real_dir)
+        config = link_parent / "config.json"
+        stop_root = tmp_path
+        with pytest.raises(ValueError, match="symlink"):
+            read_config(config, stop_root=stop_root)
