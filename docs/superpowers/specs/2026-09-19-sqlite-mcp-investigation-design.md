@@ -218,7 +218,7 @@ Example:
 
 - The database connection is opened once at startup (when `--sqlite-db` is given) and closed once at shutdown.
 - No re-opening, reconnecting, or migration logic exists.
-- On POSIX systems, deleting the database file while the connection is still open does **not** cause subsequent `INSERT` operations to fail — the open file descriptor remains valid and writes continue to the unlinked file. (The file will reappear on disk when the connection is closed and the final file descriptor is released.)
+- On POSIX systems, deleting the database file while the connection is still open does **not** cause subsequent `INSERT` operations to fail — the open file descriptor remains valid and writes continue to the unlinked inode. When the final file descriptor closes, the inode and its unlinked data are discarded; the file does not reappear.
 
 ### 7.2 Concurrent invocations
 
