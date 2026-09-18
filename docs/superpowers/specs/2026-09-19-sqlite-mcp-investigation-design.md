@@ -62,7 +62,7 @@ Startup failure modes and their severity:
 
 On process exit (normal or via `Ctrl-C`):
 
-1. Close the `sqlite3.Connection` (which flushes and closes the file).
+1. Close the `Recorder` (which acquires the lock, closes the `sqlite3.Connection`, and sets it to `None`).
 2. The existing `DecisionsClient.close()` lifecycle continues after the database close.
 
 No WAL checkpoint or `PRAGMA wal_checkpoint(FULL)` is required; `connection.close()` is sufficient to ensure durability on POSIX systems with journal mode `delete` (the default). The connection is closed only after the server transport exits.
@@ -71,7 +71,7 @@ No WAL checkpoint or `PRAGMA wal_checkpoint(FULL)` is required; `connection.clos
 
 ### 4.1 Design
 
-`Recorder` is a small, synchronous, stateless helper:
+`Recorder` is a small, synchronous helper that owns an `sqlite3.Connection` and a `threading.Lock`:
 
 ```python
 class Recorder:
@@ -79,11 +79,13 @@ class Recorder:
         self._connection = connection
         self._lock = threading.Lock()
     def log(self, timestamp: str, request: dict[str, Any], response: dict[str, Any]) -> None: ...
+    def close(self) -> None: ...
 ```
 
 - A single `threading.Lock` is created inside `__init__` and owned by the single `Recorder` instance — only one `Recorder` exists per process.
 - `connection` is the `sqlite3.Connection` object (thread-affinity controlled via `check_same_thread=False` — see §5.3).
 - `log()` serialises `request` and `response` dicts with `json.dumps(value, separators=(',', ':'), ensure_ascii=False, sort_keys=True)`, then writes a single `INSERT` row within the default implicit SQLite transaction.
+- `close()` acquires the same `threading.Lock`, closes the underlying `sqlite3.Connection`, and sets the internal reference to `None` so that subsequent `log()` calls raise immediately.
 
 ### 4.2 Schema
 
@@ -216,7 +218,7 @@ Example:
 
 - The database connection is opened once at startup (when `--sqlite-db` is given) and closed once at shutdown.
 - No re-opening, reconnecting, or migration logic exists.
-- If the database file is deleted between invocations while the process is running, the next `INSERT` will raise an exception that is sanitised as a storage error.
+- On POSIX systems, deleting the database file while the connection is still open does **not** cause subsequent `INSERT` operations to fail — the open file descriptor remains valid and writes continue to the unlinked file. (The file will reappear on disk when the connection is closed and the final file descriptor is released.)
 
 ### 7.2 Concurrent invocations
 
@@ -256,8 +258,9 @@ On unclean shutdown (SIGKILL, OOM):
 | 8 | Storage errors fail the call and create no row. | Corrupt the database *after* the table exists; call the tool (upstream succeeds); verify the call fails with a `[storage]` error and no row was written. |
 | 9 | Parent-does-not-exist exits with error, no file created. | Start with `--sqlite-db /nonexistent/path/db.sqlite`; verify exit code 1 and no file at `/nonexistent`. |
 | 10 | A database from a previous run is safe to reopen (`IF NOT EXISTS`). | Stop server after writing rows; restart with same `--sqlite-db` path; verify previous rows are still present and new writes append. |
-| 11 | Shutdown closes the database cleanly. | Start with `--sqlite-db`; send SIGTERM; verify no `sqlite3.OperationalError` on shutdown. |
+| 11 | Shutdown closes the recorder first, then the client. | Start with `--sqlite-db`; send SIGTERM; verify the recorder connection is closed before `DecisionsClient.close()` runs (no `sqlite3.OperationalError` on either step). |
 | 12 | `create_server(recorder=...)` accepts a `Recorder` instance and uses it. | Unit-test: inject a mock `Recorder`; call `jev_decide`; verify `recorder.log()` was called exactly once with `timestamp`, `request.to_dict()`, and the shaped response dict. |
+| 13 | `Recorder.close()` acquires the lock, closes the connection, and nullifies it. | Unit-test: build a `Recorder` against a temporary DB, call `close()`, verify the connection is closed and `_connection` is `None`; a subsequent `log()` call raises. |
 
 ## 10. Documentation updates
 
@@ -293,9 +296,10 @@ This file (`2026-09-19-sqlite-mcp-investigation-design.md`) is the sole spec. No
 |---|---|
 | `jev_mcp/server.py` | Add `--sqlite-db` arg to `main()`; accept `recorder` param in `create_server()` and forward to `_build_decide_tool()`. |
 | `jev_mcp/server.py` (new section) | `_build_decide_tool(..., recorder: Recorder | None = None)` signature; inject `Recorder.log()` in tool handler. |
-| `jev_mcp/server.py` (new section) | `Recorder` class definition — one file, one component. |
+| `jev_mcp/server.py` (new section) | `Recorder` class definition — one file, one component. Includes `close()` method that lock-guards and closes the `sqlite3.Connection`. |
 | `docs/superpowers/specs/2026-09-19-sqlite-mcp-investigation-design.md` | This design spec. |
 | `tests/test_mcp_server.py` | Tests for §§1–12 acceptance criteria above. New test class `TestSQLiteInvestigationLogging`. |
 | `tests/test_mcp_server.py` | Mock recorder fixture; tests for path validation, crash safety, storage error sanitisation, and no-partial-rows. |
+| `tests/test_mcp_server.py` | `Recorder.close()` tests: verify lock guard and connection state. |
 | `README.md` | Update MCP server section. |
 | `docs/wiki/Home.md` | Brief mention in MCP section. |
