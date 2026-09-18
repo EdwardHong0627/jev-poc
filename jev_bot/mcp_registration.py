@@ -18,7 +18,7 @@ class ScopeSpec:
     """Path keys for a single scope (project or user) of a harness."""
 
     path_key: str
-    server_path: str  # basename of the "jev" server key within the config file
+    server_path: str  # full dotted JSON path to the "jev" server entry
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,9 +36,6 @@ class Scopes:
     user: ScopeSpec
 
 
-# Canonical entries — one per harness.
-# Each value is the JSON-like dict that appears under the "jev" key
-# in the harness's MCP configuration file.
 _CLAUDE_CODE_ENTRY: dict = {
     "type": "stdio",
     "command": "uvx",
@@ -75,26 +72,28 @@ HARNESSES: list[str] = [
 REGISTRY: dict[str, HarnessSpec] = {
     "claude-code": HarnessSpec(
         scopes=Scopes(
-            project=ScopeSpec(path_key=".mcp.json", server_path="jev"),
-            user=ScopeSpec(path_key=".claude.json", server_path="jev"),
+            project=ScopeSpec(path_key=".mcp.json", server_path="mcpServers.jev"),
+            user=ScopeSpec(path_key=".claude.json", server_path="mcpServers.jev"),
         ),
     ),
     "opencode": HarnessSpec(
         scopes=Scopes(
-            project=ScopeSpec(path_key="opencode.json", server_path="jev"),
-            user=ScopeSpec(path_key=".config/opencode/opencode.json", server_path="jev"),
+            project=ScopeSpec(path_key="opencode.json", server_path="mcp.servers.jev"),
+            user=ScopeSpec(
+                path_key=".config/opencode/opencode.json", server_path="mcp.servers.jev"
+            ),
         ),
     ),
     "oh-my-pi": HarnessSpec(
         scopes=Scopes(
-            project=ScopeSpec(path_key=".omp/mcp.json", server_path="jev"),
-            user=ScopeSpec(path_key=".omp/agent/mcp.json", server_path="jev"),
+            project=ScopeSpec(path_key=".omp/mcp.json", server_path="mcpServers.jev"),
+            user=ScopeSpec(path_key=".omp/agent/mcp.json", server_path="mcpServers.jev"),
         ),
     ),
     "pi": HarnessSpec(
         scopes=Scopes(
-            project=ScopeSpec(path_key=".pi/mcp.json", server_path="jev"),
-            user=ScopeSpec(path_key=".pi/agent/mcp.json", server_path="jev"),
+            project=ScopeSpec(path_key=".pi/mcp.json", server_path="mcpServers.jev"),
+            user=ScopeSpec(path_key=".pi/agent/mcp.json", server_path="mcpServers.jev"),
         ),
     ),
 }

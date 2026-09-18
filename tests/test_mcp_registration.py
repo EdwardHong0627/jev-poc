@@ -323,48 +323,73 @@ def test_git_url_used_in_pi_entry() -> None:
     assert JEV_GIT_URL in entry["args"]
 
 
-# ── server_path ──────────────────────────────────────────────────────
+# ── server_path (full dotted JSON paths) ──────────────────────────────
 
 class TestServerPath:
-    """Assert that every ScopeSpec has a declarative server_path ending in 'jev'."""
+    """Assert every ScopeSpec's server_path is the full dotted JSON path."""
+
+    def test_claude_code_project_server_path(self) -> None:
+        spec = REGISTRY["claude-code"]
+        assert spec.scopes.project.server_path == "mcpServers.jev"
+
+    def test_claude_code_user_server_path(self) -> None:
+        spec = REGISTRY["claude-code"]
+        assert spec.scopes.user.server_path == "mcpServers.jev"
+
+    def test_opencode_project_server_path(self) -> None:
+        spec = REGISTRY["opencode"]
+        assert spec.scopes.project.server_path == "mcp.servers.jev"
+
+    def test_opencode_user_server_path(self) -> None:
+        spec = REGISTRY["opencode"]
+        assert spec.scopes.user.server_path == "mcp.servers.jev"
+
+    def test_oh_my_pi_project_server_path(self) -> None:
+        spec = REGISTRY["oh-my-pi"]
+        assert spec.scopes.project.server_path == "mcpServers.jev"
+
+    def test_oh_my_pi_user_server_path(self) -> None:
+        spec = REGISTRY["oh-my-pi"]
+        assert spec.scopes.user.server_path == "mcpServers.jev"
+
+    def test_pi_project_server_path(self) -> None:
+        spec = REGISTRY["pi"]
+        assert spec.scopes.project.server_path == "mcpServers.jev"
+
+    def test_pi_user_server_path(self) -> None:
+        spec = REGISTRY["pi"]
+        assert spec.scopes.user.server_path == "mcpServers.jev"
 
     def test_all_scope_specs_have_server_path(self) -> None:
         for harness in HARNESSES:
             spec = REGISTRY[harness]
-            assert spec.scopes.project.server_path == "jev"
-            assert spec.scopes.user.server_path == "jev"
+            assert spec.scopes.project.server_path.endswith(".jev")
+            assert spec.scopes.user.server_path.endswith(".jev")
 
-    def test_claude_code_project_server_path(self) -> None:
-        spec = REGISTRY["claude-code"]
-        assert spec.scopes.project.server_path == "jev"
-
-    def test_claude_code_user_server_path(self) -> None:
-        spec = REGISTRY["claude-code"]
-        assert spec.scopes.user.server_path == "jev"
-
-    def test_opencode_project_server_path(self) -> None:
+    def test_opencode_server_path_has_dots(self) -> None:
+        """OpenCode uses dotted nesting: mcp.servers.jev."""
         spec = REGISTRY["opencode"]
-        assert spec.scopes.project.server_path == "jev"
+        assert "." in spec.scopes.project.server_path
+        assert "." in spec.scopes.user.server_path
 
-    def test_opencode_user_server_path(self) -> None:
-        spec = REGISTRY["opencode"]
-        assert spec.scopes.user.server_path == "jev"
+    def test_flat_harnesses_single_key(self) -> None:
+        """Claude, OMP, Pi use a single JSON key (no dotted nesting)."""
+        for harness in ("claude-code", "oh-my-pi", "pi"):
+            spec = REGISTRY[harness]
+            key = spec.scopes.project.server_path
+            # Flat: exactly two dot-separated parts: <camelCase>.jev
+            parts = key.split(".")
+            assert len(parts) == 2
+            assert parts[-1] == "jev"
+            # The key part (before .jev) must be all-caps camelCase, no internal dots
+            assert parts[0].isalnum()
 
-    def test_oh_my_pi_project_server_path(self) -> None:
-        spec = REGISTRY["oh-my-pi"]
-        assert spec.scopes.project.server_path == "jev"
-
-    def test_oh_my_pi_user_server_path(self) -> None:
-        spec = REGISTRY["oh-my-pi"]
-        assert spec.scopes.user.server_path == "jev"
-
-    def test_pi_project_server_path(self) -> None:
-        spec = REGISTRY["pi"]
-        assert spec.scopes.project.server_path == "jev"
-
-    def test_pi_user_server_path(self) -> None:
-        spec = REGISTRY["pi"]
-        assert spec.scopes.user.server_path == "jev"
+    def test_all_server_paths_end_in_jev(self) -> None:
+        """Every harness's server_path must end in `.jev`."""
+        for harness in HARNESSES:
+            spec = REGISTRY[harness]
+            assert spec.scopes.project.server_path.endswith(".jev")
+            assert spec.scopes.user.server_path.endswith(".jev")
 
 
 class TestRegistrationTargetServerPath:
@@ -372,14 +397,49 @@ class TestRegistrationTargetServerPath:
 
     def test_project_server_path_via_registration_target(self) -> None:
         scopes = registration_target("claude-code")
-        assert scopes.project.server_path == "jev"
+        assert scopes.project.server_path == "mcpServers.jev"
 
     def test_user_server_path_via_registration_target(self) -> None:
         scopes = registration_target("opencode")
-        assert scopes.user.server_path == "jev"
+        assert scopes.user.server_path == "mcp.servers.jev"
 
     def test_all_harnesses_server_path_via_registration_target(self) -> None:
         for harness in HARNESSES:
             scopes = registration_target(harness)
-            assert scopes.project.server_path == "jev"
-            assert scopes.user.server_path == "jev"
+            assert scopes.project.server_path.endswith(".jev")
+            assert scopes.user.server_path.endswith(".jev")
+
+
+class TestServerPathTupleComponents:
+    """Assert server_path components split correctly."""
+
+    def test_claude_code_flat_key(self) -> None:
+        spec = REGISTRY["claude-code"]
+        key = spec.scopes.project.server_path
+        parts = key.split(".")
+        assert parts[-1] == "jev"
+
+    def test_opencode_nested_key(self) -> None:
+        spec = REGISTRY["opencode"]
+        key = spec.scopes.project.server_path
+        parts = key.split(".")
+        assert len(parts) == 3
+        assert parts[-1] == "jev"
+        assert parts[0] == "mcp"
+        assert parts[1] == "servers"
+
+    def test_oh_my_pi_flat_key(self) -> None:
+        spec = REGISTRY["oh-my-pi"]
+        key = spec.scopes.project.server_path
+        parts = key.split(".")
+        assert len(parts) == 2
+        assert parts[0] == "mcpServers"
+        assert parts[1] == "jev"
+
+    def test_pi_flat_key(self) -> None:
+        spec = REGISTRY["pi"]
+        key = spec.scopes.project.server_path
+        parts = key.split(".")
+        assert len(parts) == 2
+        assert parts[0] == "mcpServers"
+        assert parts[1] == "jev"
