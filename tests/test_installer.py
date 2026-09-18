@@ -1493,3 +1493,120 @@ class TestInstallPreservesExistingMCPConfig:
         data = json.loads(config_path.read_text())
         assert data["mcpServers"]["jev"]["type"] == "websocket"
 
+
+
+# ---------------------------------------------------------------------------
+# 32. Report-helper return contracts
+# ---------------------------------------------------------------------------
+
+
+class TestInstallWithReportReturn:
+    """install_with_report returns (Path, RegistrationResult)."""
+
+    def test_returns_skill_md_path(self, tmp_path: Path) -> None:
+        project = _fixture_dir(tmp_path, "report_install")
+        _ensure_installer_dir(project)
+
+        skill_path, mcp_result = install_with_report("claude-code", project_root=project)
+
+        assert isinstance(skill_path, Path)
+        assert str(skill_path).endswith("/SKILL.md")
+        assert (skill_path).is_file()
+        assert isinstance(mcp_result, RegistrationResult)
+        assert mcp_result.status is RegistrationStatus.CREATED
+        assert mcp_result.path == project / ".mcp.json"
+
+    @pytest.mark.parametrize("harness", HARNESSES)
+    def test_all_harnesses_return_created(self, tmp_path: Path, harness: str) -> None:
+        project = _fixture_dir(tmp_path, harness)
+        _ensure_installer_dir(project)
+
+        skill_path, mcp_result = install_with_report(harness, project_root=project)
+
+        assert mcp_result.status is RegistrationStatus.CREATED
+        scopes = registration_target(harness).project
+        assert mcp_result.path == project / scopes.path_key
+
+
+class TestInstallWithReportUserScope:
+    """install_with_report(..., user_home=...) returns correct paths and status."""
+
+    @pytest.mark.parametrize("harness", HARNESSES)
+    def test_user_scope_paths(self, tmp_path: Path, harness: str) -> None:
+        home = _host_home(tmp_path)
+        _ensure_installer_dir(tmp_path / "installer")
+
+        skill_path, mcp_result = install_with_report(harness, user_home=home)
+
+        scopes = registration_target(harness).user
+        expected_skill = _native_user_path(harness, home)
+        assert skill_path.parent == expected_skill
+        assert skill_path.name == "SKILL.md"
+        assert (skill_path).is_file()
+
+        assert mcp_result.status is RegistrationStatus.CREATED
+        assert mcp_result.path == home / scopes.path_key
+
+    def test_second_call_returns_exists(self, tmp_path: Path) -> None:
+        home = _host_home(tmp_path)
+        _ensure_installer_dir(tmp_path / "installer")
+
+        install_with_report("claude-code", user_home=home)
+        _, mcp_result = install_with_report("claude-code", user_home=home)
+
+        assert mcp_result.status is RegistrationStatus.EXISTS
+
+
+class TestUninstallWithReportReturn:
+    """uninstall_with_report returns (skill_md_path, RegistrationResult)."""
+
+    def test_returns_skill_md_path(self, tmp_path: Path) -> None:
+        project = _fixture_dir(tmp_path, "report_uninstall")
+        _ensure_installer_dir(project)
+
+        install("claude-code", project_root=project)
+
+        skill_path, mcp_result = uninstall_with_report("claude-code", project_root=project)
+
+        assert isinstance(skill_path, Path)
+        assert str(skill_path).endswith("/SKILL.md")
+        assert mcp_result.status is RegistrationStatus.REMOVED
+        assert mcp_result.path == project / ".mcp.json"
+
+    @pytest.mark.parametrize("harness", HARNESSES)
+    def test_all_harnesses_return_removed(self, tmp_path: Path, harness: str) -> None:
+        project = _fixture_dir(tmp_path, harness)
+        _ensure_installer_dir(project)
+
+        install(harness, project_root=project)
+
+        _, mcp_result = uninstall_with_report(harness, project_root=project)
+
+        assert mcp_result.status is RegistrationStatus.REMOVED
+
+    def test_absent_returns_status(self, tmp_path: Path) -> None:
+        project = _fixture_dir(tmp_path, "absent_uninstall")
+        _ensure_installer_dir(project)
+
+        _, mcp_result = uninstall_with_report("claude-code", project_root=project)
+
+        assert mcp_result.status is RegistrationStatus.ABSENT
+
+
+class TestUninstallWithReportUserScope:
+    """uninstall_with_report(..., user_home=...) returns correct paths."""
+
+    @pytest.mark.parametrize("harness", HARNESSES)
+    def test_user_scope(self, tmp_path: Path, harness: str) -> None:
+        home = _host_home(tmp_path)
+        _ensure_installer_dir(tmp_path / "installer")
+
+        install(harness, user_home=home)
+
+        skill_path, mcp_result = uninstall_with_report(harness, user_home=home)
+
+        assert str(skill_path).endswith("/SKILL.md")
+        assert mcp_result.status is RegistrationStatus.REMOVED
+        scopes = registration_target(harness).user
+        assert mcp_result.path == home / scopes.path_key
+
