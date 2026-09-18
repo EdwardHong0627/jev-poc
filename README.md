@@ -43,3 +43,12 @@ Selected: <choice>
   <candidate>: <probability>
   ...
 ```
+## Install with uvx
+
+`uvx` runs the `jev` console entry point from a freshly isolated environment,
+so no local package installation is required:
+
+```sh
+uvx --from git+https://github.com/EdwardHong0627/jev-poc.git jev --help
+```
+
