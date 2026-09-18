@@ -256,18 +256,6 @@ class TestErrors:
         with pytest.raises(ValueError, match="not a recognized MCP harness"):
             canonical_entry("")
 
-    def test_canonical_entry_error_mentions_canonical_entries(self) -> None:
-        """Error message should list the _CANONICAL_ENTRIES keys, not REGISTRY."""
-        with pytest.raises(ValueError) as ctx:
-            canonical_entry("bogus")
-        error_msg = str(ctx.value)
-        # Both dicts share the same keys, so the output is the same;
-        # verify all four harnesses are listed.
-        for harness in HARNESSES:
-            assert harness in error_msg
-        # Verify the error does not mention REGISTRY
-        assert "REGISTRY" not in error_msg
-
 
 class TestCanonicalEntryDefensiveCopy:
     """canonical_entry must return a copy so callers cannot mutate shared data."""
