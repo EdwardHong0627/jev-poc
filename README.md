@@ -56,7 +56,7 @@ Three question types are supported:
 |------------|----------------------------------------|---------------------|
 | `choice`   | `instructions` + `criteria` (2–16 key→desc) | `choiceResult` with `choice`, `probabilities`, `confidence` |
 | `score`    | `instructions` + `criteria` (2–16 strings) | `scoreResult` with `score`, `confidence`, `extra` |
-| `noul`     | `instructions` (optionally `criteria` 1–16 key→desc) | `noulResult` with `noul`, optional `confidence` |
+| `noul`     | `instructions` (no `criteria`)              | `noulResult` with `noul`, optional `confidence` |
 
 ### Building a request
 
@@ -79,7 +79,6 @@ request = JEVRequest(
         ),
         "risk": NoulQuestion(
             instructions="How risky is this?",
-            criteria={"low": "Low risk", "high": "High risk"},
         ),
     },
 )

@@ -128,8 +128,9 @@ def _build_decide_tool(client: DecisionsClient, config: Config | None = None) ->
         *state* – free-text context (non-blank, ≤ 8 000 chars).
         *questions* – 1–8 question map keyed by name (regex
         ``^[A-Za-z][A-Za-z0-9_]{0,63}$``).  Each value is a dict with
-        required non-blank ``instructions`` (≤ 2000 chars) and
-        required ``criteria`` (2–16 entries):
+        required non-blank ``instructions`` (≤ 2000 chars).
+        ``criteria`` is required for ``choice`` (2–16 key→desc dict) and
+        ``score`` (2–16 string list), but NOT for ``noul``:
 
         * ``choice`` – criteria dict of non-blank key→description pairs.
         * ``score`` – criteria list of non-blank strings.
