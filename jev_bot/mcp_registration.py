@@ -242,3 +242,242 @@ def write_config_atomic(path: Path, value: dict, *, stop_root: Path) -> None:
         except OSError:
             pass
         raise
+
+
+# ── Task 3: server-path helpers ──────────────────────────────────────
+
+
+def _split_server_path(server_path: str) -> list[str]:
+    """Split a dotted server_path into its key components."""
+    return server_path.split(".")
+
+
+def _get_nested(data: dict, keys: list[str]) -> dict | None:
+    """Walk *keys* inside *data*, returning ``None`` if any key is missing."""
+    cur: dict | None = data
+    for key in keys:
+        if not isinstance(cur, dict) or key not in cur:
+            return None
+        cur = cur[key]
+    if not isinstance(cur, dict):
+        return None
+    return cur
+
+
+def _set_nested(data: dict, keys: list[str], value: dict) -> None:
+    """Set *value* inside *data* following *keys*, creating intermediates."""
+    cur = data
+    for key in keys[:-1]:
+        if key not in cur or not isinstance(cur[key], dict):
+            cur[key] = {}
+        cur = cur[key]
+    cur[keys[-1]] = value
+
+
+def _del_nested(data: dict, keys: list[str]) -> None:
+    """Delete the leaf key in *data* along *keys*, if present,
+    pruning empty parent dicts on the way up."""
+    cur: dict = data
+    parents: list[tuple[dict, str]] = []
+    for key in keys[:-1]:
+        if not isinstance(cur, dict) or key not in cur:
+            return
+        parents.append((cur, key))
+        cur = cur[key]
+    if isinstance(cur, dict) and keys[-1] in cur:
+        del cur[keys[-1]]
+        # Prune empty dicts back up the chain
+        for parent, key in reversed(parents):
+            if parent[key] == {}:
+                del parent[key]
+            else:
+                break
+
+
+def _ensure_parent_dirs(path: Path, *, stop_root: Path) -> None:
+    """Create parent directories for *path*, with stop_root validation."""
+    parent = path.parent
+    if parent and not parent.exists():
+        _reject_symlink(parent, stop_root)
+        parent.mkdir(parents=True, exist_ok=True)
+
+
+# ── Classification ────────────────────────────────────────────────────
+
+
+class ServerEntryState:
+    """Classification outcome for a single server-path entry."""
+
+    ABSENT = "absent"
+    CANONICAL = "canonical"
+    FOREIGN = "foreign"
+
+
+def classify_server_entry(
+    harness: str,
+    config_path: Path,
+    *,
+    stop_root: Path,
+) -> str:
+    """Classify the state of *harness*'s ``jev`` server entry in *config_path*.
+
+    Returns one of:
+    - ``"absent"`` — no server config file or ``jev`` key missing
+    - ``"canonical"`` — a ``jev`` entry matching the harness canonical spec
+    - ``"foreign"`` — a ``jev`` entry present but not matching the canonical spec
+    """
+    scopes = registration_target(harness)
+    canonical = canonical_entry(harness)
+    keys = _split_server_path(scopes.project.server_path)
+
+    config = read_config(config_path, stop_root=stop_root)
+    entry = _get_nested(config, keys)
+
+    if entry is None:
+        return ServerEntryState.ABSENT
+
+    # Compare against canonical (same keys+values).
+    if entry == canonical:
+        return ServerEntryState.CANONICAL
+
+    return ServerEntryState.FOREIGN
+
+
+# ── Install / Uninstall ──────────────────────────────────────────────
+
+
+def install_server(
+    harness: str,
+    *,
+    project_root: Path | None = None,
+    user_home: Path | None = None,
+    force: bool = False,
+) -> Path:
+    """Install the JEV MCP server entry into the harness config.
+
+    Classification-driven:
+
+    - **Absent** — writes the canonical ``jev`` entry (new config file if
+      needed).
+    - **Canonical** — no-op; returns the config path unchanged.
+    - **Foreign** — raises ``ValueError`` unless *force* is ``True``, in
+      which case it replaces **only** the ``jev`` key with the canonical
+      entry (preserving sibling server entries).
+
+    Exactly one of *project_root* or *user_home* must be provided.
+
+    Returns
+    -------
+    Path
+        The path to the config file that was read / written.
+    """
+    if harness not in REGISTRY:
+        raise ValueError(
+            f"'{harness}' is not a recognized MCP harness "
+            f"(expected one of {list(REGISTRY)})"
+        )
+
+    if project_root is not None and user_home is not None:
+        raise ValueError(
+            "Provide exactly one of project_root or user_home, not both"
+        )
+    if project_root is None and user_home is None:
+        raise ValueError(
+            "Exactly one of project_root or user_home must be provided"
+        )
+
+    if project_root is not None:
+        stop_root = project_root
+        scopes = registration_target(harness).project
+    else:
+        stop_root = user_home
+        scopes = registration_target(harness).user
+
+    config_path = stop_root / scopes.path_key
+
+    state = classify_server_entry(harness, config_path, stop_root=stop_root)
+
+    if state == ServerEntryState.ABSENT:
+        new_config: dict = {}
+        _set_nested(new_config, _split_server_path(scopes.server_path), canonical_entry(harness))
+        _ensure_parent_dirs(config_path, stop_root=stop_root)
+        write_config_atomic(config_path, new_config, stop_root=stop_root)
+
+    elif state == ServerEntryState.CANONICAL:
+        pass  # no-op
+
+    else:
+        # FOREIGN
+        if not force:
+            raise ValueError(
+                f"Refusing to install: '{scopes.server_path}' exists in "
+                f"{config_path} but does not match the canonical entry. "
+                f"Use force=True to replace."
+            )
+        config = read_config(config_path, stop_root=stop_root)
+        _set_nested(config, _split_server_path(scopes.server_path), canonical_entry(harness))
+        write_config_atomic(config_path, config, stop_root=stop_root)
+
+    return config_path
+
+
+def uninstall_server(
+    harness: str,
+    *,
+    project_root: Path | None = None,
+    user_home: Path | None = None,
+) -> Path:
+    """Uninstall the JEV MCP server entry from the harness config.
+
+    Classification-driven:
+
+    - **Canonical** — removes the ``jev`` key and writes back the config.
+      If the config becomes empty, the file is removed.
+    - **Absent** — no-op; returns the config path.
+    - **Foreign** — no mutation; returns the config path with no error.
+
+    Exactly one of *project_root* or *user_home* must be provided.
+
+    Returns
+    -------
+    Path
+        The path to the config file.
+    """
+    if harness not in REGISTRY:
+        raise ValueError(
+            f"'{harness}' is not a recognized MCP harness "
+            f"(expected one of {list(REGISTRY)})"
+        )
+
+    if project_root is not None and user_home is not None:
+        raise ValueError(
+            "Provide exactly one of project_root or user_home, not both"
+        )
+    if project_root is None and user_home is None:
+        raise ValueError(
+            "Exactly one of project_root or user_home must be provided"
+        )
+
+    if project_root is not None:
+        stop_root = project_root
+        scopes = registration_target(harness).project
+    else:
+        stop_root = user_home
+        scopes = registration_target(harness).user
+
+    config_path = stop_root / scopes.path_key
+
+    state = classify_server_entry(harness, config_path, stop_root=stop_root)
+
+    if state == ServerEntryState.CANONICAL:
+        config = read_config(config_path, stop_root=stop_root)
+        _del_nested(config, _split_server_path(scopes.server_path))
+        # Write back regardless — even if empty, the file is retained.
+        write_config_atomic(config_path, config, stop_root=stop_root)
+
+    elif state == ServerEntryState.FOREIGN:
+        pass  # no mutation
+
+    # absent → also no-op
+
+    return config_path
