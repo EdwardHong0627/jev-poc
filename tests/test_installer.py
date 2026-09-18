@@ -1123,3 +1123,156 @@ class TestInstallerNoBrokenNames:
         source = inspect.getsource(__import__("jev_bot.installer", fromlist=[""]))
         assert "_unused" not in source, "installer.py should not reference _unused"
 
+
+
+# ---------------------------------------------------------------------------
+# 29. Partial-write protection — no mutation if either domain fails
+# ---------------------------------------------------------------------------
+
+
+class TestInstallPreflightsSkillSource:
+    """Install fails atomically if the packaged skill source is unreadable."""
+
+    def test_raises_before_any_mcp_write(self, tmp_path: Path) -> None:
+        project = _fixture_dir(tmp_path, "bad_src")
+        _ensure_installer_dir(project)
+
+        # Mock _read_skill_bytes to return empty bytes (simulating broken package).
+        with mock.patch(
+            "jev_bot.installer._read_skill_bytes", return_value=b"",
+        ):
+            with pytest.raises(FileNotFoundError, match="empty"):
+                install("claude-code", project_root=project)
+
+        # No MCP config should have been written.
+        config_path = project / ".mcp.json"
+        assert not config_path.exists()
+
+    def test_raises_before_skill_dir_created(self, tmp_path: Path) -> None:
+        project = _fixture_dir(tmp_path, "bad_src2")
+        _ensure_installer_dir(project)
+
+        with mock.patch(
+            "jev_bot.installer._read_skill_bytes", return_value=b"",
+        ):
+            with pytest.raises(FileNotFoundError, match="empty"):
+                install("claude-code", project_root=project)
+
+        skill_dir = _native_project_path("claude-code", project)
+        assert not skill_dir.exists()
+
+
+class TestInstallPreflightsMalformedMCPConfig:
+    """Install fails atomically if the MCP config file is malformed JSON."""
+
+    def test_raises_before_skill_created(self, tmp_path: Path) -> None:
+        project = _fixture_dir(tmp_path, "bad_mcp")
+        _ensure_installer_dir(project)
+
+        config_path = project / ".mcp.json"
+        config_path.write_text("{not valid json}", encoding="utf-8")
+
+        with pytest.raises(ValueError, match="Malformed JSON"):
+            install("claude-code", project_root=project)
+
+        # No skill directory was created (partial-state protection).
+        skill_dir = _native_project_path("claude-code", project)
+        assert not skill_dir.exists()
+
+    def test_raises_before_skill_created_array_config(self, tmp_path: Path) -> None:
+        """A JSON array at the top level is rejected before skill write."""
+        project = _fixture_dir(tmp_path, "bad_mcp_arr")
+        _ensure_installer_dir(project)
+
+        config_path = project / ".mcp.json"
+        config_path.write_text('["not", "an", "object"]', encoding="utf-8")
+
+        with pytest.raises(ValueError, match="must be a JSON object"):
+            install("claude-code", project_root=project)
+
+        skill_dir = _native_project_path("claude-code", project)
+        assert not skill_dir.exists()
+
+
+class TestInstallPreflightsSymlinkedConfig:
+    """Install fails atomically if the MCP config file or its ancestry is a symlink."""
+
+    def test_raises_before_skill_created(self, tmp_path: Path) -> None:
+        project = _fixture_dir(tmp_path, "symlink_mcp")
+        _ensure_installer_dir(project)
+
+        real_config = tmp_path / "real_mcp.json"
+        real_config.write_text("{}", encoding="utf-8")
+        config_path = project / ".mcp.json"
+        config_path.symlink_to(real_config)
+
+        with pytest.raises(ValueError, match="symlink"):
+            install("claude-code", project_root=project)
+
+        skill_dir = _native_project_path("claude-code", project)
+        assert not skill_dir.exists()
+
+
+class TestUninstallPreflightsMalformedMCPConfig:
+    """Uninstall fails atomically if the MCP config is malformed JSON — skill stays."""
+
+    def test_skill_retained_after_failure(self, tmp_path: Path) -> None:
+        project = _fixture_dir(tmp_path, "bad_mcp_uni")
+        _ensure_installer_dir(project)
+
+        # Install skill (write config with valid JSON).
+        install("claude-code", project_root=project)
+
+        # Corrupt the config file to malformed JSON.
+        config_path = project / ".mcp.json"
+        config_path.write_text("{not valid json}", encoding="utf-8")
+
+        with pytest.raises(ValueError, match="Malformed JSON"):
+            uninstall("claude-code", project_root=project)
+
+        # Skill must still be present — partial-state protection.
+        skill_dir = _native_project_path("claude-code", project)
+        assert skill_dir.exists()
+        assert (skill_dir / "SKILL.md").exists()
+
+    def test_skill_retained_after_failure_array_config(self, tmp_path: Path) -> None:
+        """Array config rejects uninstall — skill stays."""
+        project = _fixture_dir(tmp_path, "bad_mcp_arr_uni")
+        _ensure_installer_dir(project)
+
+        install("claude-code", project_root=project)
+
+        config_path = project / ".mcp.json"
+        config_path.write_text('["bad"]', encoding="utf-8")
+
+        with pytest.raises(ValueError, match="must be a JSON object"):
+            uninstall("claude-code", project_root=project)
+
+        skill_dir = _native_project_path("claude-code", project)
+        assert skill_dir.exists()
+        assert (skill_dir / "SKILL.md").exists()
+
+
+class TestUninstallPreflightsSymlinkedMCPConfig:
+    """Uninstall fails atomically if the MCP config is a symlink — skill stays."""
+
+    def test_skill_retained(self, tmp_path: Path) -> None:
+        project = _fixture_dir(tmp_path, "symlink_uni")
+        _ensure_installer_dir(project)
+
+        install("claude-code", project_root=project)
+
+        # Replace config with symlink.
+        real_config = tmp_path / "real_cfg.json"
+        real_config.write_text("{}", encoding="utf-8")
+        config_path = project / ".mcp.json"
+        config_path.unlink()
+        config_path.symlink_to(real_config)
+
+        with pytest.raises(ValueError, match="symlink"):
+            uninstall("claude-code", project_root=project)
+
+        skill_dir = _native_project_path("claude-code", project)
+        assert skill_dir.exists()
+        assert (skill_dir / "SKILL.md").exists()
+

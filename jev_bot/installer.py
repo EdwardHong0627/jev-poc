@@ -124,8 +124,9 @@ def install_with_report(
 ) -> Tuple[Path, RegistrationResult]:
     """Install the JEV skill and MCP registration, returning the report.
 
-    Preflights the MCP configuration first so that a foreign MCP entry
-    raises **before** any skill directory is created (no partial state).
+    Preflights both the skill source and the MCP configuration before any
+    filesystem mutation.  A failure in either domain leaves **no partial
+    state** (no skill directory, no MCP config change).
 
     Returns a ``(skill_path, registration_result)`` tuple where *registration_*
     *result* describes the MCP registration outcome.
@@ -142,13 +143,8 @@ def install_with_report(
             "Exactly one of project_root or user_home must be provided"
         )
 
-    # Step 1: preflight MCP config — classifies and returns result.
-    # Raises ValueError for a foreign entry before any skill is written.
-    mcp_result = install_server(
-        harness, project_root=project_root, user_home=user_home, force=force,
-    )
-
-    # Step 2: write the skill (safe — MCP was preflighted).
+    # Step 1: preflight skill source — must exist and be non-empty before
+    # any write, so a packaging issue cannot leave a half-written config.
     src_bytes = _read_skill_bytes()
     if not src_bytes:
         raise FileNotFoundError(f"SKILL.md is empty in package")
@@ -157,12 +153,22 @@ def install_with_report(
 
     if project_root is not None:
         project_path = _build_path(project_root, project_suffix) / SKILL_NAME
+    else:
+        user_path = _build_path(user_home, user_suffix) / SKILL_NAME  # type: ignore[unreachable]
+
+    # Step 2: preflight MCP config — raises ValueError for foreign entry
+    # or malformed/symlinked config *before* we write anything.
+    mcp_result = install_server(
+        harness, project_root=project_root, user_home=user_home, force=force,
+    )
+
+    # Step 3: write the skill (safe — both domains preflighted).
+    if project_root is not None:
         _install_one(project_path, project_root, src_bytes, force)
         return project_path / "SKILL.md", mcp_result
 
     # user_home is not None here
-    user_path = _build_path(user_home, user_suffix) / SKILL_NAME
-    _install_one(user_path, user_home, src_bytes, force)
+    _install_one(user_path, user_home, src_bytes, force)  # type: ignore[unreachable]
     return user_path / "SKILL.md", mcp_result
 
 
@@ -201,6 +207,10 @@ def uninstall_with_report(
 ) -> Tuple[Path, RegistrationResult]:
     """Uninstall the JEV skill and MCP registration, returning the report.
 
+    Preflights and classifies the MCP configuration before deleting the skill,
+    so that a malformed/symlinked config leaves **no partial state** (skill
+    remains intact).
+
     Returns a ``(skill_path, registration_result)`` tuple where *registration_*
     *result* describes the MCP registration outcome.
     """
@@ -220,23 +230,22 @@ def uninstall_with_report(
 
     if project_root is not None:
         project_path = _build_path(project_root, project_suffix) / SKILL_NAME
-        _uninstall_one(project_path, project_root)
-        skill_path = project_path / "SKILL.md"
-
+        # Step 1: classify MCP config before deleting skill — raises on
+        # malformed/symlinked config, leaving the skill intact.
         mcp_result = uninstall_server(
             harness, project_root=project_root,
         )
-        return skill_path, mcp_result
+        # Step 2: safe to delete skill — MCP was preflighted.
+        _uninstall_one(project_path, project_root)
+        return project_path / "SKILL.md", mcp_result
 
     # user_home is not None here
     user_path = _build_path(user_home, user_suffix) / SKILL_NAME
-    _uninstall_one(user_path, user_home)
-    skill_path = user_path / "SKILL.md"
-
     mcp_result = uninstall_server(
         harness, user_home=user_home,
     )
-    return skill_path, mcp_result
+    _uninstall_one(user_path, user_home)
+    return user_path / "SKILL.md", mcp_result
 
 
 # ---------------------------------------------------------------------------
