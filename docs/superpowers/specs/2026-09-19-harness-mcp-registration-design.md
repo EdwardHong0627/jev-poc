@@ -10,7 +10,7 @@ Extend the existing `jev install` and `jev uninstall` commands so they manage th
 - Extend existing `install` and `uninstall` commands rather than adding a separate MCP command group.
 - The JEV decision engine selected removal of the JEV-owned MCP registration during uninstall (`0.96` probability, `0.92` confidence).
 - The JEV decision engine selected a portable package console launcher (`1.00` probability, `1.00` confidence) rather than a source-checkout or absolute-environment launcher.
-- Add a `jev-mcp` console script targeting `jev_mcp.server:main`. Registrations invoke it through `uvx --from git+https://github.com/EdwardHong0627/jev-poc.git jev-mcp`.
+- Add a `jev-mcp` console script targeting `jev_mcp.server:main`. Registrations invoke it through `uvx --from git+https://github.com/EdwardHong0627/jev-poc.git jev-mcp`. Do not advertise or install registrations until a published repository revision contains that entry point.
 - Never store `JEV_API_TOKEN` or `JEV_ENDPOINT` in a harness configuration file. The server uses its inherited host environment and the existing JEV configuration precedence.
 
 ## Harness configuration registry
@@ -31,7 +31,7 @@ Pi requires its separately installed `pi-mcp-extension`. The JEV installer write
 - Registration is idempotent when the existing `jev` entry is structurally equal to the canonical JEV entry for that harness.
 - A different existing `jev` entry is foreign. Normal install reports a conflict and does not modify it. `--force` explicitly replaces it.
 - Uninstall removes a `jev` entry only when it structurally matches the canonical registration. A foreign or altered entry is left intact and reported.
-- Config mutation reads the complete JSON object, updates only the owning server key, and writes the complete object back. All unrelated keys and server entries are preserved.
+- Config mutation reads the complete JSON object, updates only the owning server key, then atomically replaces the file from a same-directory temporary file. All unrelated keys and server entries are preserved.
 - Invalid, non-object, or symlinked configuration files are rejected before either skill or MCP mutation. The implementation performs all preflight checks before writes.
 - Uninstall leaves an otherwise empty configuration file in place; configuration-file lifecycle is not owned by JEV.
 
@@ -55,4 +55,4 @@ Pi requires its separately installed `pi-mcp-extension`. The JEV installer write
 
 ## Verification
 
-Tests exercise every harness and both scopes: new-file creation, merge with unrelated configuration, idempotency, foreign-entry refusal, forced replacement, narrow uninstall, malformed config refusal, and the `jev-mcp` package script. A focused CLI smoke test installs a representative harness into a temporary project and validates the resulting native configuration.
+Tests exercise every harness and both scopes: new-file creation, merge with unrelated configuration, idempotency, foreign-entry refusal, forced replacement, narrow uninstall, malformed-config and symlink refusal, and the `jev-mcp` package script. A Claude user-config merge test preserves unrelated top-level state. A focused launcher smoke test resolves the packaged `jev-mcp` command, and a focused CLI smoke test installs a representative harness into a temporary project and validates the resulting native configuration.
