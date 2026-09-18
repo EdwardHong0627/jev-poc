@@ -12,6 +12,7 @@ import json
 import os
 import tempfile
 from dataclasses import dataclass, field
+from enum import Enum, auto
 from pathlib import Path
 
 from copy import deepcopy
@@ -291,6 +292,37 @@ def _lookup(data: dict, keys: list[str]) -> _LookupResult:
     return _LookupResult(present=True, value=cur)
 
 
+# ── Registration outcomes ──────────────────────────────────────────
+
+
+class RegistrationStatus(Enum):
+    """Outcome of an install or uninstall operation."""
+
+    CREATED = auto()
+    EXISTS = auto()
+    REPLACED = auto()
+    REMOVED = auto()
+    ABSENT = auto()
+    FOREIGN = auto()
+
+
+@dataclass(frozen=True)
+class RegistrationResult:
+    """Result of a registration operation.
+
+    Attributes
+    ----------
+    path : Path
+        The config file path that was read / written.
+    status : RegistrationStatus
+        One of ``CREATED``, ``EXISTS``, ``REPLACED``, ``REMOVED``,
+        ``ABSENT``, or ``FOREIGN``.
+    """
+
+    path: Path
+    status: RegistrationStatus
+
+
 # Legacy name for _get_nested — returns None when path is absent or non-dict,
 # dict value otherwise. Kept for test compatibility.
 def _get_nested(data: dict, keys: list[str]) -> dict | None:
@@ -392,7 +424,7 @@ def install_server(
     project_root: Path | None = None,
     user_home: Path | None = None,
     force: bool = False,
-) -> Path:
+) -> RegistrationResult:
     """Install the JEV MCP server entry into the harness config.
 
     Classification-driven:
@@ -408,8 +440,8 @@ def install_server(
 
     Returns
     -------
-    Path
-        The path to the config file that was read / written.
+    RegistrationResult
+        The path to the config file and its operation status.
     """
     if harness not in REGISTRY:
         raise ValueError(
@@ -444,9 +476,10 @@ def install_server(
         _set_nested(config, _split_server_path(scopes.server_path), canonical_entry(harness))
         _ensure_parent_dirs(config_path, stop_root=stop_root)
         write_config_atomic(config_path, config, stop_root=stop_root)
+        return RegistrationResult(path=config_path, status=RegistrationStatus.CREATED)
 
     elif state == ServerEntryState.CANONICAL:
-        pass  # no-op
+        return RegistrationResult(path=config_path, status=RegistrationStatus.EXISTS)
 
     else:
         # FOREIGN
@@ -459,8 +492,7 @@ def install_server(
         config = read_config(config_path, stop_root=stop_root)
         _set_nested(config, _split_server_path(scopes.server_path), canonical_entry(harness))
         write_config_atomic(config_path, config, stop_root=stop_root)
-
-    return config_path
+        return RegistrationResult(path=config_path, status=RegistrationStatus.REPLACED)
 
 
 def uninstall_server(
@@ -468,7 +500,7 @@ def uninstall_server(
     *,
     project_root: Path | None = None,
     user_home: Path | None = None,
-) -> Path:
+) -> RegistrationResult:
     """Uninstall the JEV MCP server entry from the harness config.
 
     Classification-driven:
@@ -482,8 +514,8 @@ def uninstall_server(
 
     Returns
     -------
-    Path
-        The path to the config file.
+    RegistrationResult
+        The path to the config file and its operation status.
     """
     if harness not in REGISTRY:
         raise ValueError(
@@ -516,10 +548,10 @@ def uninstall_server(
         _del_nested(config, _split_server_path(scopes.server_path))
         # Write back regardless — even if empty, the file is retained.
         write_config_atomic(config_path, config, stop_root=stop_root)
+        return RegistrationResult(path=config_path, status=RegistrationStatus.REMOVED)
 
     elif state == ServerEntryState.FOREIGN:
-        pass  # no mutation
+        return RegistrationResult(path=config_path, status=RegistrationStatus.FOREIGN)
 
-    # absent → also no-op
-
-    return config_path
+    # absent → no-op
+    return RegistrationResult(path=config_path, status=RegistrationStatus.ABSENT)

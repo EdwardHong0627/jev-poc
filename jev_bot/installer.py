@@ -1,7 +1,6 @@
 """JEV installer — package-native skill installation for four harnesses.
 
-Provides :func:`install` and :func:`uninstall` scoped to exactly one harness
-destination (project root or user home).
+Coordinates skill installation with MCP server registration.
 """
 
 from __future__ import annotations
@@ -10,6 +9,13 @@ import importlib.resources
 import shutil
 from importlib.resources.abc import Traversable
 from pathlib import Path
+from typing import Tuple
+
+from jev_bot.mcp_registration import (
+    RegistrationResult,
+    install_server,
+    uninstall_server,
+)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -87,7 +93,12 @@ def install(
     user_home: Path | None = None,
     force: bool = False,
 ) -> Path:
-    """Install the JEV skill into the *harness*'s native destination.
+    """Install the JEV skill and MCP registration into the *harness*'s destination.
+
+    Preflights the MCP configuration and installs the skill plus a canonical
+    ``jev`` MCP server entry.  A pre-existing foreign MCP entry raises a
+    ``ValueError`` *before* any skill directory is created (unless *force* is
+    ``True``, which replaces only that MCP entry).
 
     Exactly one of *project_root* or *user_home* must be provided.
     *project_root* targets the harness's project path only.
@@ -97,6 +108,27 @@ def install(
     -------
     Path
         The target ``SKILL.md`` path that was written.
+    """
+    skill_path, _result = install_with_report(
+        harness, project_root=project_root, user_home=user_home, force=force,
+    )
+    return skill_path
+
+
+def install_with_report(
+    harness: str,
+    *,
+    project_root: Path | None = None,
+    user_home: Path | None = None,
+    force: bool = False,
+) -> Tuple[Path, RegistrationResult]:
+    """Install the JEV skill and MCP registration, returning the report.
+
+    Preflights the MCP configuration first so that a foreign MCP entry
+    raises **before** any skill directory is created (no partial state).
+
+    Returns a ``(skill_path, registration_result)`` tuple where *registration_*
+    *result* describes the MCP registration outcome.
     """
     if harness not in VALID_HARNESSES:
         raise ValueError(f"Unknown harness {harness!r}; expected one of {sorted(VALID_HARNESSES)}")
@@ -110,6 +142,13 @@ def install(
             "Exactly one of project_root or user_home must be provided"
         )
 
+    # Step 1: preflight MCP config — classifies and returns result.
+    # Raises ValueError for a foreign entry before any skill is written.
+    mcp_result = install_server(
+        harness, project_root=project_root, user_home=user_home, force=force,
+    )
+
+    # Step 2: write the skill (safe — MCP was preflighted).
     src_bytes = _read_skill_bytes()
     if not src_bytes:
         raise FileNotFoundError(f"SKILL.md is empty in package")
@@ -119,12 +158,13 @@ def install(
     if project_root is not None:
         project_path = _build_path(project_root, project_suffix) / SKILL_NAME
         _install_one(project_path, project_root, src_bytes, force)
-        return project_path / "SKILL.md"
+        return project_path / "SKILL.md", mcp_result
 
     # user_home is not None here
     user_path = _build_path(user_home, user_suffix) / SKILL_NAME
     _install_one(user_path, user_home, src_bytes, force)
-    return user_path / "SKILL.md"
+    return user_path / "SKILL.md", mcp_result
+
 
 
 def uninstall(
@@ -133,20 +173,36 @@ def uninstall(
     project_root: Path | None = None,
     user_home: Path | None = None,
 ) -> Path:
-    """Remove the JEV skill from the *harness*'s native destination.
+    """Remove the JEV skill and MCP registration from the *harness*'s destination.
+
+    Preflights the MCP configuration and removes the skill plus a canonical
+    ``jev`` MCP server entry.  Foreign MCP entries are reported but not mutated.
 
     Exactly one of *project_root* or *user_home* must be provided.
     *project_root* targets the harness's project path only.
     *user_home* targets the harness's user path only.
 
-    No-op when the skill does not exist.
-    Removes only the SKILL.md file; retains sibling files.
-    Prunes empty directories without removing the harness root.
-
     Returns
     -------
     Path
         The target ``SKILL.md`` path that was removed.
+    """
+    skill_path, _result = uninstall_with_report(
+        harness, project_root=project_root, user_home=user_home,
+    )
+    return skill_path
+
+
+def uninstall_with_report(
+    harness: str,
+    *,
+    project_root: Path | None = None,
+    user_home: Path | None = None,
+) -> Tuple[Path, RegistrationResult]:
+    """Uninstall the JEV skill and MCP registration, returning the report.
+
+    Returns a ``(skill_path, registration_result)`` tuple where *registration_*
+    *result* describes the MCP registration outcome.
     """
     if harness not in VALID_HARNESSES:
         raise ValueError(f"Unknown harness {harness!r}; expected one of {sorted(VALID_HARNESSES)}")
@@ -165,12 +221,22 @@ def uninstall(
     if project_root is not None:
         project_path = _build_path(project_root, project_suffix) / SKILL_NAME
         _uninstall_one(project_path, project_root)
-        return project_path / "SKILL.md"
+        skill_path = project_path / "SKILL.md"
+
+        mcp_result = uninstall_server(
+            harness, project_root=project_root,
+        )
+        return skill_path, mcp_result
 
     # user_home is not None here
     user_path = _build_path(user_home, user_suffix) / SKILL_NAME
     _uninstall_one(user_path, user_home)
-    return user_path / "SKILL.md"
+    skill_path = user_path / "SKILL.md"
+
+    mcp_result = uninstall_server(
+        harness, user_home=user_home,
+    )
+    return skill_path, mcp_result
 
 
 # ---------------------------------------------------------------------------

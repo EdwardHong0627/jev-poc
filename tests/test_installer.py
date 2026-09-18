@@ -16,6 +16,15 @@ from jev_bot.installer import (
     VALID_HARNESSES,
     install,
     uninstall,
+    install_with_report,
+    uninstall_with_report,
+)
+from jev_bot.mcp_registration import (
+    HARNESSES,
+    RegistrationResult,
+    RegistrationStatus,
+    canonical_entry,
+    registration_target,
 )
 
 
@@ -495,7 +504,8 @@ class TestPruning:
         uninstall("opencode", user_home=home)
 
         assert not (home / ".config" / "opencode" / "skills" / SKILL_NAME).exists()
-        assert not (home / ".config" / "opencode").exists()
+        # MCP config file is retained (no file deletion on uninstall).
+        assert (home / ".config" / "opencode" / "opencode.json").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -860,3 +870,256 @@ class TestUninstallPruningBoundary:
         assert not skill_dir.exists()
         assert (skills_parent / "keep.txt").exists()
         assert (project / ".claude").is_dir()
+
+
+# ---------------------------------------------------------------------------
+# 25. MCP registration integration — install writes both skill and config
+# ---------------------------------------------------------------------------
+
+
+class TestInstallWritesBothSkillAndMCP:
+    """Install writes the native skill AND the canonical MCP config."""
+
+    @pytest.mark.parametrize("harness", HARNESSES)
+    def test_project_scope(self, tmp_path: Path, harness: str) -> None:
+        project = _fixture_dir(tmp_path, harness)
+        _ensure_installer_dir(project)
+        scopes = registration_target(harness).project
+        config_path = project / scopes.path_key
+
+        skill_path = install(harness, project_root=project)
+
+        # Skill exists
+        assert (skill_path).exists()
+        assert (skill_path).read_text().startswith("# Using JEV")
+
+        # MCP config exists and has canonical jev entry
+        assert config_path.exists()
+        data = json.loads(config_path.read_text())
+        from jev_bot.mcp_registration import _split_server_path
+        keys = scopes.server_path.split(".")
+        entry = data
+        for k in keys:
+            entry = entry[k]
+        assert entry == canonical_entry(harness)
+
+
+class TestInstallWritesBothSkillAndMCPUserScope:
+    """Install writes the native skill AND the canonical MCP config (user scope)."""
+
+    @pytest.mark.parametrize("harness", HARNESSES)
+    def test_user_scope(self, tmp_path: Path, harness: str) -> None:
+        home = _host_home(tmp_path)
+        _ensure_installer_dir(tmp_path / "installer")
+        scopes = registration_target(harness).user
+        config_path = home / scopes.path_key
+
+        skill_path = install(harness, user_home=home)
+
+        assert (skill_path).exists()
+        assert config_path.exists()
+        data = json.loads(config_path.read_text())
+        from jev_bot.mcp_registration import _split_server_path
+        keys = scopes.server_path.split(".")
+        entry = data
+        for k in keys:
+            entry = entry[k]
+        assert entry == canonical_entry(harness)
+
+
+class TestInstallWithReportReturnsResult:
+    """install_with_report returns a RegistrationResult with CREATED status."""
+
+    @pytest.mark.parametrize("harness", HARNESSES)
+    def test_project_scope(self, tmp_path: Path, harness: str) -> None:
+        project = _fixture_dir(tmp_path, harness)
+        _ensure_installer_dir(project)
+
+        skill_path, mcp_result = install_with_report(harness, project_root=project)
+
+        assert skill_path is not None
+        assert isinstance(mcp_result, RegistrationResult)
+        assert mcp_result.status is RegistrationStatus.CREATED
+        assert mcp_result.path == project / registration_target(harness).project.path_key
+
+
+# ---------------------------------------------------------------------------
+# 26. Foreign MCP entry prevents install (no partial state)
+# ---------------------------------------------------------------------------
+
+
+class TestForeignMCPRefusesInstall:
+    """A pre-existing foreign MCP entry must cause install to raise before
+    any skill directory is created."""
+
+    @pytest.mark.parametrize("harness", HARNESSES)
+    def test_normal_install_fails_with_foreign_config(self, tmp_path: Path, harness: str) -> None:
+        project = _fixture_dir(tmp_path, harness)
+        _ensure_installer_dir(project)
+        scopes = registration_target(harness).project
+        config_path = project / scopes.path_key
+
+        # Seed a foreign jev entry.
+        keys = scopes.server_path.split(".")
+        data: dict = {}
+        cur = data
+        for k in keys[:-1]:
+            cur[k] = {}
+            cur = cur[k]
+        cur[keys[-1]] = {"type": "websocket", "url": "https://foreign.com"}
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+        with pytest.raises(ValueError, match="Refusing to install"):
+            install(harness, project_root=project)
+
+        # No skill directory was created (no partial state).
+        native_path = _native_project_path(harness, project)
+        assert not native_path.exists(), (
+            "Skill directory should not be created when MCP install fails"
+        )
+
+
+class TestForeignMCPForceInstallWorks:
+    """Install with force=True replaces foreign MCP entry and writes the skill."""
+
+    @pytest.mark.parametrize("harness", HARNESSES)
+    def test_project_scope(self, tmp_path: Path, harness: str) -> None:
+        project = _fixture_dir(tmp_path, harness)
+        _ensure_installer_dir(project)
+        scopes = registration_target(harness).project
+        config_path = project / scopes.path_key
+
+        # Seed a foreign jev entry.
+        keys = scopes.server_path.split(".")
+        data: dict = {}
+        cur = data
+        for k in keys[:-1]:
+            cur[k] = {}
+            cur = cur[k]
+        cur[keys[-1]] = {"type": "websocket", "url": "https://foreign.com"}
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+        skill_path = install(harness, project_root=project, force=True)
+
+        assert skill_path.exists()
+        data_after = json.loads(config_path.read_text())
+        entry = data_after
+        for k in keys:
+            entry = entry[k]
+        assert entry == canonical_entry(harness)
+
+
+# ---------------------------------------------------------------------------
+# 27. Uninstall removes both skill and MCP registration
+# ---------------------------------------------------------------------------
+
+
+class TestUninstallRemovesBoth:
+    """Uninstall removes the skill directory AND the MCP jev entry."""
+
+    @pytest.mark.parametrize("harness", HARNESSES)
+    def test_project_scope(self, tmp_path: Path, harness: str) -> None:
+        project = _fixture_dir(tmp_path, harness)
+        _ensure_installer_dir(project)
+        scopes = registration_target(harness).project
+        config_path = project / scopes.path_key
+
+        install(harness, project_root=project)
+        uninstall(harness, project_root=project)
+
+        # Skill removed.
+        native_path = _native_project_path(harness, project)
+        assert not native_path.exists()
+
+        # Config file retained but jev entry removed (intermediate
+        # dicts pruned by _del_nested, so the path is absent).
+        assert config_path.exists()
+        data = json.loads(config_path.read_text())
+        keys = scopes.server_path.split(".")
+        # Walk the keys; if any key is missing the entry is absent.
+        cur = data
+        found = True
+        for k in keys:
+            if isinstance(cur, dict) and k in cur:
+                cur = cur[k]
+            else:
+                found = False
+                break
+        assert not found
+
+
+class TestUninstallRetainsUnrelatedConfig:
+    """Uninstall retains unrelated config keys in the MCP config file."""
+
+    @pytest.mark.parametrize("harness", HARNESSES)
+    def test_project_scope(self, tmp_path: Path, harness: str) -> None:
+        project = _fixture_dir(tmp_path, harness)
+        _ensure_installer_dir(project)
+        scopes = registration_target(harness).project
+        config_path = project / scopes.path_key
+
+        # Seed a config with an unrelated key.
+        data: dict = {"otherKey": {"plugin": "value"}, "sibling": {"x": 1}}
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+        install(harness, project_root=project)
+        uninstall(harness, project_root=project)
+
+        data_after = json.loads(config_path.read_text())
+        assert data_after.get("otherKey") == {"plugin": "value"}
+        assert data_after.get("sibling") == {"x": 1}
+
+
+class TestUninstallForeignConfigNotMutated:
+    """Uninstall on a foreign MCP config does not mutate it."""
+
+    @pytest.mark.parametrize("harness", HARNESSES)
+    def test_project_scope(self, tmp_path: Path, harness: str) -> None:
+        project = _fixture_dir(tmp_path, harness)
+        _ensure_installer_dir(project)
+        scopes = registration_target(harness).project
+        config_path = project / scopes.path_key
+
+        # Seed a foreign jev entry.
+        keys = scopes.server_path.split(".")
+        data: dict = {}
+        cur = data
+        for k in keys[:-1]:
+            cur[k] = {}
+            cur = cur[k]
+        cur[keys[-1]] = {"type": "websocket", "url": "https://foreign.com"}
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+        skill_dir = _native_project_path(harness, project)
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text("# JEV\n")
+
+        uninstall(harness, project_root=project)
+
+        # Skill removed.
+        assert not skill_dir.exists()
+        # Foreign config not mutated.
+        data_after = json.loads(config_path.read_text())
+        entry = data_after
+        for k in keys:
+            entry = entry[k]
+        assert entry == {"type": "websocket", "url": "https://foreign.com"}
+
+
+# ---------------------------------------------------------------------------
+# 28. _unused name removal (cleanup from previous edit)
+# ---------------------------------------------------------------------------
+
+
+class TestInstallerNoBrokenNames:
+    """Installer must not reference undefined variables."""
+
+    def test_no_unused_in_source(self) -> None:
+        import inspect
+        source = inspect.getsource(__import__("jev_bot.installer", fromlist=[""]))
+        assert "_unused" not in source, "installer.py should not reference _unused"
+

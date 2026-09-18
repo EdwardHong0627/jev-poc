@@ -10,6 +10,8 @@ from pathlib import Path
 from jev_bot.mcp_registration import (
     HARNESSES,
     REGISTRY,
+    RegistrationResult,
+    RegistrationStatus,
     ServerEntryState,
     _get_nested,
     _del_nested,
@@ -125,7 +127,7 @@ class TestInstallAbsent:
 
         result_path = install_server(harness, project_root=project)
 
-        assert result_path == config_path
+        assert result_path.path == config_path
         assert config_path.exists()
         data = json.loads(config_path.read_text())
         entry = data
@@ -148,7 +150,7 @@ class TestInstallAbsentCreatesParentDirs:
 
         result_path = install_server(harness, user_home=home)
 
-        assert result_path == config_path
+        assert result_path.path == config_path
         assert config_path.exists()
 
 
@@ -227,7 +229,7 @@ class TestInstallCanonicalNoOp:
 
         result_path = install_server(harness, project_root=project)
 
-        assert result_path == config_path
+        assert result_path.path == config_path
         # Content unchanged — still canonical
         data_after = json.loads(config_path.read_text())
         entry = data_after
@@ -278,7 +280,7 @@ class TestInstallForeignForce:
 
         result_path = install_server(harness, project_root=project, force=True)
 
-        assert result_path == config_path
+        assert result_path.path == config_path
         data_after = json.loads(config_path.read_text())
         # Sibling preserved
         assert data_after.get("someOtherServer") == {"type": "stdio", "command": "other"}
@@ -300,7 +302,7 @@ class TestInstallUserScope:
 
         result_path = install_server(harness, user_home=home)
 
-        assert result_path == config_path
+        assert result_path.path == config_path
         assert config_path.exists()
 
 
@@ -350,7 +352,7 @@ class TestUninstallCanonical:
 
         result_path = uninstall_server(harness, project_root=project)
 
-        assert result_path == config_path
+        assert result_path.path == config_path
         data_after = read_config(config_path, stop_root=project)
         assert _get_nested(data_after, keys) is None
 
@@ -399,7 +401,7 @@ class TestUninstallForeignNoMutation:
 
         result_path = uninstall_server(harness, project_root=project)
 
-        assert result_path == config_path
+        assert result_path.path == config_path
         assert config_path.exists()
         # Foreign entry is still there
         data_after = read_config(config_path, stop_root=project)
@@ -421,7 +423,7 @@ class TestUninstallAbsentNoOp:
 
         result_path = uninstall_server(harness, project_root=project)
 
-        assert result_path == config_path
+        assert result_path.path == config_path
         assert not config_path.exists()
 
 
@@ -445,7 +447,7 @@ class TestUninstallUserScope:
 
         result_path = uninstall_server(harness, user_home=home)
 
-        assert result_path == config_path
+        assert result_path.path == config_path
         assert config_path.exists()  # still exists, just jev removed
         data_after = read_config(config_path, stop_root=home)
         assert _get_nested(data_after, keys) is None
@@ -832,3 +834,138 @@ from jev_bot.mcp_registration import (
             assert f"import {banned}" not in source_lines, (
                 f"mcp_registration.py should not import {banned}"
             )
+
+
+# ── 8. RegistrationResult — installer integration (Task 4) ──────────
+
+
+class TestInstallServerReturnsResult:
+    """install_server returns a RegistrationResult, not a bare Path."""
+
+    @pytest.mark.parametrize("harness", HARNESSES)
+    def test_project_scope_created(self, tmp_path: Path, harness: str) -> None:
+        project = _fixture_project(tmp_path, harness)
+        scopes = registration_target(harness).project
+        config_path = project / scopes.path_key
+
+        result = install_server(harness, project_root=project)
+
+        assert isinstance(result, RegistrationResult)
+        assert result.path == config_path
+        assert result.status is RegistrationStatus.CREATED
+
+
+class TestInstallServerCanonicalReturnsResult:
+    """install_server on a canonical entry returns EXISTS, not CREATED."""
+
+    @pytest.mark.parametrize("harness", HARNESSES)
+    def test_project_scope(self, tmp_path: Path, harness: str) -> None:
+        project = _fixture_project(tmp_path, harness)
+        scopes = registration_target(harness).project
+        config_path = project / scopes.path_key
+        canonical = canonical_entry(harness)
+        keys = scopes.server_path.split(".")
+        data: dict = {}
+        cur = data
+        for key in keys[:-1]:
+            cur[key] = {}
+            cur = cur[key]
+        cur[keys[-1]] = canonical
+        _write_json(config_path, data)
+
+        result = install_server(harness, project_root=project)
+
+        assert result.status is RegistrationStatus.EXISTS
+        assert result.path == config_path
+
+
+class TestInstallServerForeignForceReturnsResult:
+    """install_server with force=True on a foreign entry returns REPLACED."""
+
+    @pytest.mark.parametrize("harness", HARNESSES)
+    def test_project_scope(self, tmp_path: Path, harness: str) -> None:
+        project = _fixture_project(tmp_path, harness)
+        scopes = registration_target(harness).project
+        config_path = project / scopes.path_key
+        keys = scopes.server_path.split(".")
+        data: dict = {}
+        cur = data
+        for key in keys[:-1]:
+            cur[key] = {}
+            cur = cur[key]
+        cur[keys[-1]] = {"type": "websocket", "url": "https://foreign.com"}
+        _write_json(config_path, data)
+
+        result = install_server(harness, project_root=project, force=True)
+
+        assert result.status is RegistrationStatus.REPLACED
+        assert result.path == config_path
+
+
+class TestUninstallServerCanonicalReturnsResult:
+    """uninstall_server on a canonical entry returns REMOVED."""
+
+    @pytest.mark.parametrize("harness", HARNESSES)
+    def test_project_scope(self, tmp_path: Path, harness: str) -> None:
+        project = _fixture_project(tmp_path, harness)
+        scopes = registration_target(harness).project
+        config_path = project / scopes.path_key
+        canonical = canonical_entry(harness)
+        keys = scopes.server_path.split(".")
+        data: dict = {}
+        cur = data
+        for key in keys[:-1]:
+            cur[key] = {}
+            cur = cur[key]
+        cur[keys[-1]] = canonical
+        _write_json(config_path, data)
+
+        result = uninstall_server(harness, project_root=project)
+
+        assert result.status is RegistrationStatus.REMOVED
+        assert result.path == config_path
+
+
+class TestUninstallServerAbsentReturnsResult:
+    """uninstall_server on an absent entry returns ABSENT."""
+
+    @pytest.mark.parametrize("harness", HARNESSES)
+    def test_project_scope(self, tmp_path: Path, harness: str) -> None:
+        project = _fixture_project(tmp_path, harness)
+        scopes = registration_target(harness).project
+        config_path = project / scopes.path_key
+
+        result = uninstall_server(harness, project_root=project)
+
+        assert result.status is RegistrationStatus.ABSENT
+        assert result.path == config_path
+
+
+class TestUninstallServerForeignReturnsResult:
+    """uninstall_server on a foreign entry returns FOREIGN without mutation."""
+
+    @pytest.mark.parametrize("harness", HARNESSES)
+    def test_project_scope(self, tmp_path: Path, harness: str) -> None:
+        project = _fixture_project(tmp_path, harness)
+        scopes = registration_target(harness).project
+        config_path = project / scopes.path_key
+        keys = scopes.server_path.split(".")
+        data: dict = {}
+        cur = data
+        for key in keys[:-1]:
+            cur[key] = {}
+            cur = cur[key]
+        cur[keys[-1]] = {"type": "websocket", "url": "https://foreign.com"}
+        _write_json(config_path, data)
+
+        result = uninstall_server(harness, project_root=project)
+
+        assert result.status is RegistrationStatus.FOREIGN
+        assert result.path == config_path
+        # Foreign content still intact — read the leaf key from the nested structure.
+        data_after = read_config(config_path, stop_root=project)
+        entry = data_after
+        for k in keys:
+            entry = entry[k]  # type: ignore[index]
+        assert entry == {"type": "websocket", "url": "https://foreign.com"}
+
