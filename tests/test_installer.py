@@ -1276,3 +1276,130 @@ class TestUninstallPreflightsSymlinkedMCPConfig:
         assert skill_dir.exists()
         assert (skill_dir / "SKILL.md").exists()
 
+
+
+# ---------------------------------------------------------------------------
+# 30. Uninstall preflight skill — no mutation if skill is invalid
+# ---------------------------------------------------------------------------
+
+
+class TestUninstallPreflightsSkillSymlink:
+    """Uninstall raises before mutating MCP config when skill target is a symlink."""
+
+    def test_symlinked_skill_dir_blocks_mcp_mutation(self, tmp_path: Path) -> None:
+        project = _fixture_dir(tmp_path, "symlink_skill")
+        _ensure_installer_dir(project)
+
+        # First install normally.
+        install("claude-code", project_root=project)
+
+        # Replace skill dir with a symlink to a real dir.
+        real_target = tmp_path / "real_skills"
+        real_target.mkdir()
+        skill_dir = _native_project_path("claude-code", project)
+        if skill_dir.is_dir():
+            shutil.rmtree(skill_dir)
+        skill_dir.symlink_to(real_target)
+
+        config_path = project / ".mcp.json"
+        config_text = config_path.read_text()
+
+        with pytest.raises(RuntimeError, match="symlink"):
+            uninstall("claude-code", project_root=project)
+
+        # MCP config must NOT have been mutated — still has canonical jev.
+        assert config_path.read_text() == config_text
+        data = json.loads(config_path.read_text())
+        from jev_bot.mcp_registration import _split_server_path
+        keys = _split_server_path(registration_target("claude-code").project.server_path)
+        cur = data
+        for k in keys:
+            if isinstance(cur, dict) and k in cur:
+                cur = cur[k]
+            else:
+                cur = {}
+                break
+        # jev key should still exist (was not removed by uninstall).
+        assert cur.get("type") == "stdio"
+
+    def test_symlinked_skill_file_blocks_mcp_mutation(self, tmp_path: Path) -> None:
+        """Symlinked SKILL.md (not skill dir) also blocks MCP mutation."""
+        project = _fixture_dir(tmp_path, "symlink_skill_file")
+        _ensure_installer_dir(project)
+
+        install("claude-code", project_root=project)
+
+        skill_md = _native_project_path("claude-code", project) / "SKILL.md"
+        real_file = tmp_path / "real_skill.md"
+        real_file.write_text("# real skill\n", encoding="utf-8")
+        skill_md.unlink()
+        skill_md.symlink_to(real_file)
+
+        config_path = project / ".mcp.json"
+        config_text = config_path.read_text()
+
+        with pytest.raises(RuntimeError, match="symlink"):
+            uninstall("claude-code", project_root=project)
+
+        # MCP config preserved — jev entry still canonical.
+        assert config_path.read_text() == config_text
+
+
+class TestUninstallPreflightsMissingSkill:
+    """Uninstall with a missing skill target still reads/mutates MCP config."""
+
+    def test_mcp_canonical_removed_when_skill_missing(self, tmp_path: Path) -> None:
+        """If skill dir is absent, uninstall still removes the canonical MCP entry."""
+        project = _fixture_dir(tmp_path, "missing_skill")
+        _ensure_installer_dir(project)
+
+        install("claude-code", project_root=project)
+
+        # Remove the skill dir manually (MCP config intact).
+        skill_dir = _native_project_path("claude-code", project)
+        shutil.rmtree(skill_dir)
+
+        uninstall("claude-code", project_root=project)
+
+        config_path = project / ".mcp.json"
+        data = json.loads(config_path.read_text())
+        from jev_bot.mcp_registration import _split_server_path
+        keys = _split_server_path(registration_target("claude-code").project.server_path)
+        cur = data
+        for k in keys:
+            if isinstance(cur, dict) and k in cur:
+                cur = cur[k]
+            else:
+                cur = {}
+                break
+        assert cur is None or "type" not in cur  # jev entry removed
+
+
+class TestUninstallCanonicalAndSymlinkedSkillBothRegressed:
+    """End-to-end: canonical MCP + symlinked skill regression proving both remain."""
+
+    def test_canonical_mcp_preserved_on_symlink_block(self, tmp_path: Path) -> None:
+        """A canonical MCP config must remain intact when skill is symlinked."""
+        project = _fixture_dir(tmp_path, "canonical_mcp_symlink_skill")
+        _ensure_installer_dir(project)
+
+        install("claude-code", project_root=project)
+
+        config_path = project / ".mcp.json"
+        canonical_before = json.loads(config_path.read_text())
+        assert canonical_before["mcpServers"]["jev"]["type"] == "stdio"
+
+        # Corrupt skill dir.
+        skill_dir = _native_project_path("claude-code", project)
+        shutil.rmtree(skill_dir)
+        real_target = tmp_path / "real_fake"
+        real_target.mkdir()
+        skill_dir.symlink_to(real_target)
+
+        with pytest.raises(RuntimeError, match="symlink"):
+            uninstall("claude-code", project_root=project)
+
+        # Canonical MCP must be completely unchanged.
+        canonical_after = json.loads(config_path.read_text())
+        assert canonical_after == canonical_before
+

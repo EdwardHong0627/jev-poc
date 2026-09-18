@@ -207,9 +207,9 @@ def uninstall_with_report(
 ) -> Tuple[Path, RegistrationResult]:
     """Uninstall the JEV skill and MCP registration, returning the report.
 
-    Preflights and classifies the MCP configuration before deleting the skill,
-    so that a malformed/symlinked config leaves **no partial state** (skill
-    remains intact).
+    Preflights **both** the skill target and the MCP configuration before
+    any mutation.  A failure in either domain leaves **no partial state**:
+    no skill deletion and no MCP config mutation.
 
     Returns a ``(skill_path, registration_result)`` tuple where *registration_*
     *result* describes the MCP registration outcome.
@@ -227,30 +227,44 @@ def uninstall_with_report(
         )
 
     project_suffix, user_suffix = HARNESS_MAP[harness]
+    stop_root = project_root if project_root is not None else user_home  # type: ignore[assignment]
 
-    if project_root is not None:
-        project_path = _build_path(project_root, project_suffix) / SKILL_NAME
-        # Step 1: classify MCP config before deleting skill — raises on
-        # malformed/symlinked config, leaving the skill intact.
-        mcp_result = uninstall_server(
-            harness, project_root=project_root,
-        )
-        # Step 2: safe to delete skill — MCP was preflighted.
-        _uninstall_one(project_path, project_root)
-        return project_path / "SKILL.md", mcp_result
+    # Step 1: preflight skill target — symlink checks, no mutation.
+    skill_target = _build_path(stop_root, project_suffix if project_root is not None else user_suffix) / SKILL_NAME
+    _preflight_skill_for_uninstall(skill_target, stop_root)
 
-    # user_home is not None here
-    user_path = _build_path(user_home, user_suffix) / SKILL_NAME
+    # Step 2: classify MCP config — raises on malformed/symlinked config.
     mcp_result = uninstall_server(
-        harness, user_home=user_home,
+        harness, project_root=project_root, user_home=user_home,
     )
-    _uninstall_one(user_path, user_home)
-    return user_path / "SKILL.md", mcp_result
+
+    # Step 3: safe to delete skill — both domains preflighted.
+    _uninstall_one(skill_target, stop_root)
+    return skill_target / "SKILL.md", mcp_result
 
 
 # ---------------------------------------------------------------------------
 # Install / Uninstall internals
 # ---------------------------------------------------------------------------
+
+
+def _preflight_skill_for_uninstall(target: Path, stop_root: Path) -> None:
+    """Raise if the skill target or its symlink ancestry is unsafe.
+
+    Read-only preflight: no files are deleted or modified.  Mirrors the
+    symlink and structural checks that ``_uninstall_one`` performs,
+    extracted so they can be called **before** MCP mutation.
+    """
+    if not target.exists():
+        return
+
+    # Check full symlink chain from target up to stop_root.
+    _find_symlink_ancestry(target, stop_root)
+
+    # Ensure SKILL.md is not itself a symlink.
+    skill_md = target / "SKILL.md"
+    if skill_md.is_symlink():
+        raise RuntimeError(f"Cannot uninstall: {skill_md} is a symlink")
 
 
 def _install_one(target: Path, stop_root: Path, content: bytes, force: bool) -> None:
