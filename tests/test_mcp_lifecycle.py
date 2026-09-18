@@ -152,6 +152,61 @@ class TestInstallAbsentCreatesParentDirs:
         assert config_path.exists()
 
 
+class TestInstallAbsentPreservesExistingContent:
+    """Install in ABSENT state must NOT overwrite existing sibling keys.
+
+    Regression test: when the config file already exists with other content
+    (but the jev key is absent), install must read the file, set only the jev
+    nested key, and write back — preserving every other top-level key.
+    """
+
+    @pytest.mark.parametrize("harness", HARNESSES)
+    def test_project_scope(self, tmp_path: Path, harness: str) -> None:
+        project = _fixture_project(tmp_path, harness)
+        scopes = registration_target(harness).project
+        config_path = project / scopes.path_key
+        keys = scopes.server_path.split(".")
+        # Config exists with top-level siblings but no jev key
+        data: dict = {
+            "plugins": {"foo": True},
+            "someOtherServer": {"type": "stdio", "command": "echo hello"},
+        }
+        _write_json(config_path, data)
+
+        install_server(harness, project_root=project)
+
+        data_after = json.loads(config_path.read_text())
+        # Siblings preserved
+        assert data_after.get("plugins") == {"foo": True}
+        assert data_after.get("someOtherServer") == {
+            "type": "stdio",
+            "command": "echo hello",
+        }
+        # jev key is now present and canonical
+        entry = data_after
+        for key in keys:
+            entry = entry[key]
+        assert entry == canonical_entry(harness)
+
+    @pytest.mark.parametrize("harness", HARNESSES)
+    def test_user_scope(self, tmp_path: Path, harness: str) -> None:
+        home = _fixture_user_home(tmp_path, harness)
+        scopes = registration_target(harness).user
+        config_path = home / scopes.path_key
+        keys = scopes.server_path.split(".")
+        data: dict = {"plugins": {"bar": 42}}
+        _write_json(config_path, data)
+
+        install_server(harness, user_home=home)
+
+        data_after = json.loads(config_path.read_text())
+        assert data_after.get("plugins") == {"bar": 42}
+        entry = data_after
+        for key in keys:
+            entry = entry[key]
+        assert entry == canonical_entry(harness)
+
+
 class TestInstallCanonicalNoOp:
     """Install is a no-op when the server entry is already canonical."""
 

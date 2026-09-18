@@ -398,10 +398,12 @@ def install_server(
     state = classify_server_entry(harness, config_path, stop_root=stop_root)
 
     if state == ServerEntryState.ABSENT:
-        new_config: dict = {}
-        _set_nested(new_config, _split_server_path(scopes.server_path), canonical_entry(harness))
+        config: dict = {}
+        if config_path.exists():
+            config = read_config(config_path, stop_root=stop_root)
+        _set_nested(config, _split_server_path(scopes.server_path), canonical_entry(harness))
         _ensure_parent_dirs(config_path, stop_root=stop_root)
-        write_config_atomic(config_path, new_config, stop_root=stop_root)
+        write_config_atomic(config_path, config, stop_root=stop_root)
 
     elif state == ServerEntryState.CANONICAL:
         pass  # no-op
@@ -432,7 +434,7 @@ def uninstall_server(
     Classification-driven:
 
     - **Canonical** — removes the ``jev`` key and writes back the config.
-      If the config becomes empty, the file is removed.
+      The empty config file is retained (no file deletion).
     - **Absent** — no-op; returns the config path.
     - **Foreign** — no mutation; returns the config path with no error.
 
