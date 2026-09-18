@@ -8,7 +8,11 @@ no Typer dependency, no filesystem or config-store coupling.
 
 from __future__ import annotations
 
+import json
+import os
+import tempfile
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from copy import deepcopy
 
@@ -134,3 +138,92 @@ def canonical_entry(harness: str) -> dict:
             f"(expected one of {list(_CANONICAL_ENTRIES)})"
         )
     return deepcopy(_CANONICAL_ENTRIES[harness])
+
+
+# ── Config read / write helpers (Task 2) ──────────────────────────────
+
+
+def _reject_symlink(path: Path) -> None:
+    """Raise ``ValueError`` if *path* or any of its parents (up to the
+    selected project/user root) is a symlink.
+
+    The check walks the resolved path *backwards* so that a symlinked
+    ancestor directory is also refused even when the final component is
+    a real file.
+    """
+    # Walk from the file itself up through every parent component.
+    # Stop at the root of the filesystem (no more parents).
+    for component in path.parents:
+        if component.is_symlink():
+            raise ValueError(
+                f"Refusing config path through symlink: {component}"
+            )
+    if path.is_symlink():
+        raise ValueError(
+            f"Refusing config path: {path} is a symlink"
+        )
+
+
+def read_config(path: Path) -> dict:
+    """Read and parse a JSON config file.
+
+    Returns an empty dict ``{}`` when the file does not exist.
+    Raises ``ValueError`` when the file is malformed or the top-level
+    JSON value is not an object.
+    """
+    _reject_symlink(path)
+
+    if not path.exists():
+        return {}
+
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ValueError(f"Cannot read config {path}: {exc}") from exc
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"Malformed JSON in {path}: {exc}"
+        ) from exc
+
+    if not isinstance(data, dict):
+        raise ValueError(
+            f"Config {path} must be a JSON object, got {type(data).__name__}"
+        )
+
+    return data
+
+
+def write_config_atomic(path: Path, value: dict) -> None:
+    """Write *value* as UTF-8 JSON to *path* atomically.
+
+    Creates parent directories as needed.  Writes to a temporary file
+    in the same directory, fsyncs it, and replaces the target via
+    ``os.replace`` (no pre-deletion of the target).
+
+    Raises ``ValueError`` if *path* or any ancestor component (up to
+    the chosen project/user root) is a symlink.
+    """
+    _reject_symlink(path)
+
+    parent = path.parent
+    if parent and not parent.exists():
+        parent.mkdir(parents=True, exist_ok=True)
+
+    fd, tmp_path = tempfile.mkstemp(dir=str(parent), suffix=".tmp")
+    try:
+        os.write(fd, json.dumps(value, indent=2).encode("utf-8"))
+        os.fsync(fd)
+        os.close(fd)
+        fd = -1  # already closed
+        os.replace(tmp_path, str(path))
+    except BaseException:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
