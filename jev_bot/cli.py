@@ -15,7 +15,13 @@ from jev_bot.config_store import (
     read_user_config,
     write_user_config,
 )
-from jev_bot.installer import install as _install, uninstall as _uninstall
+from jev_bot.installer import (
+    install as _install,
+    install_with_report,
+    uninstall as _uninstall,
+    uninstall_with_report,
+)
+from jev_bot.mcp_registration import RegistrationStatus
 
 app = typer.Typer(
     help="JEV Decisions API — install/uninstall skills and manage config.",
@@ -218,10 +224,10 @@ def install(
     force: bool = typer.Option(
         False,
         "--force",
-        help="Force overwrite of existing skill.",
+        help="Force overwrite of existing skill and replace a foreign JEV MCP registration.",
     ),
 ) -> None:
-    """Install the JEV skill into a harness destination."""
+    """Install the JEV skill and MCP registration into a harness destination."""
     if project_root is None and user_home is None:
         typer.echo(
             "Error: exactly one of --project or --user is required.", err=True,
@@ -233,21 +239,16 @@ def install(
         )
         raise SystemExit(1)
 
-    kwargs: dict = {"harness": harness}
-    if project_root is not None:
-        kwargs["project_root"] = project_root
-    if user_home is not None:
-        kwargs["user_home"] = user_home
-    if force:
-        kwargs["force"] = True
-
     try:
-        target = _install(**kwargs)
+        skill_path, mcp_result = install_with_report(
+            harness, project_root=project_root, user_home=user_home, force=force,
+        )
     except ValueError as exc:
         typer.echo(f"Error: {exc}", err=True)
         raise SystemExit(1)
 
-    typer.echo(f"Installed: {target}")
+    typer.echo(f"Installed: {skill_path}")
+    typer.echo(f"MCP config: {mcp_result.path}")
 
 
 @app.command()
@@ -275,7 +276,7 @@ def uninstall(
         exists=False,
     ),
 ) -> None:
-    """Uninstall the JEV skill from a harness destination."""
+    """Uninstall the JEV skill and MCP registration from a harness destination."""
     if project_root is None and user_home is None:
         typer.echo(
             "Error: exactly one of --project or --user is required.", err=True,
@@ -287,19 +288,18 @@ def uninstall(
         )
         raise SystemExit(1)
 
-    kwargs: dict = {"harness": harness}
-    if project_root is not None:
-        kwargs["project_root"] = project_root
-    if user_home is not None:
-        kwargs["user_home"] = user_home
-
     try:
-        target = _uninstall(**kwargs)
+        skill_path, mcp_result = uninstall_with_report(
+            harness, project_root=project_root, user_home=user_home,
+        )
     except ValueError as exc:
         typer.echo(f"Error: {exc}", err=True)
         raise SystemExit(1)
 
-    typer.echo(f"Uninstalled: {target}")
+    typer.echo(f"Uninstalled: {skill_path}")
+    typer.echo(f"MCP config: {mcp_result.path}")
+    if mcp_result.status is RegistrationStatus.FOREIGN:
+        typer.echo("Warning: foreign MCP registration retained.", err=True)
 
 
 if __name__ == "__main__":
