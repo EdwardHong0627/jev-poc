@@ -13,23 +13,25 @@ fails with a configuration error.
 
 ## Install with uvx
 
-`uvx` runs the `jev` console entry point from a freshly isolated environment,
-so no local package installation is required:
+`uvx` runs the `jev` and `jev-mcp` console entry points from a freshly isolated
+environment, so no local package installation is required:
 
 ```sh
 uvx --from git+https://github.com/EdwardHong0627/jev-poc.git jev --help
+uvx --from git+https://github.com/EdwardHong0627/jev-poc.git jev-mcp --help
 ```
 
 ## Console CLI
 
-A Typer-based CLI provides skill installation, removal, and config management:
+A Typer-based CLI provides skill installation, removal, config management, and
+portable MCP server registration:
 
 ```sh
-# Install the JEV skill into a harness destination
+# Install the JEV skill and MCP registration into a harness destination
 jev install <harness> --project <path>
 jev install <harness> --user <path>
 
-# Remove a previously installed skill
+# Remove a previously installed skill and MCP registration from a harness destination
 jev uninstall <harness> --project <path>
 jev uninstall <harness> --user <path>
 
@@ -43,6 +45,78 @@ jev config unset endpoint              # remove stored endpoint
 
 Valid harness names: `claude-code`, `opencode`, `oh-my-pi`, `pi`. Exactly one
 of `--project` or `--user` is required for install/uninstall.
+
+### What install does
+
+Each `jev install` command performs two operations:
+
+1. **Skill write** — copies the packaged `using-jev-decisions` SKILL.md into the
+   harness's skill directory under the chosen root (project or user).
+
+2. **MCP server registration** — writes (or replaces) the `jev` server entry in
+   the harness's MCP configuration file using the portable `uvx` launcher. No
+   secrets, absolute paths, or checkout-specific references are embedded.
+
+```
+# Project-root example (Oh My Pi)
+$ jev install oh-my-pi --project /path/to/project
+
+# Writes:
+#   /path/to/project/.omp/skills/using-jev-decisions/SKILL.md
+#   /path/to/project/.omp/mcp.json  →  { "mcpServers": { "jev": { ... } } }
+```
+
+### Harness paths and MCP configuration shapes
+
+| Harness | Skill path (project / user) | Config file (project / user) | JSON server path | Transport entry |
+|---------|-----------------------------|------------------------------|------------------|-----------------|
+| `claude-code` | `.claude/skills` / `.claude/skills` | `.mcp.json` / `.claude.json` | `mcpServers.jev` | `{ "type": "stdio", "command": "uvx", "args": ["--from", "git+https://github.com/EdwardHong0627/jev-poc.git", "jev-mcp"] }` |
+| `opencode` | `.opencode/skills` / `.config/opencode/skills` | `opencode.json` / `.config/opencode/opencode.json` | `mcp.servers.jev` | `{ "type": "local", "command": ["uvx", "--from", "git+https://github.com/EdwardHong0627/jev-poc.git", "jev-mcp"] }` |
+| `oh-my-pi` | `.omp/skills` / `.omp/agent/skills` | `.omp/mcp.json` / `.omp/agent/mcp.json` | `mcpServers.jev` | `{ "type": "stdio", "command": "uvx", "args": ["--from", "git+https://github.com/EdwardHong0627/jev-poc.git", "jev-mcp"] }` |
+| `pi` | `.pi/skills` / `.pi/agent/skills` | `.pi/mcp.json` / `.pi/agent/mcp.json` | `mcpServers.jev` | `{ "transport": "stdio", "command": "uvx", "args": ["--from", "git+https://github.com/EdwardHong0627/jev-poc.git", "jev-mcp"], "lifecycle": "lazy" }` |
+
+### MCP launcher
+
+The portable launcher command is:
+
+```sh
+uvx --from git+https://github.com/EdwardHong0627/jev-poc.git jev-mcp
+```
+
+This invokes the `jev-mcp` console script from `jev_mcp.server.main()`. The MCP
+server reads `JEV_API_TOKEN` and `JEV_ENDPOINT` from the harness process's
+environment — no secrets are written to any harness config file by the
+installer.
+
+### --force flag
+
+Pass `--force` to overwrite an existing skill file and replace a foreign JEV MCP
+registration (a `jev` entry that is present but does not match the canonical
+shape). Without `--force`, install fails with an error if the harness already
+contains a non-canonical `jev` entry.
+
+### Uninstall
+
+`jev uninstall` removes both the skill and the owned MCP server entry from the
+harness destination. If the `jev` server entry was written by a different system
+or has been modified, uninstall retains the foreign entry and prints a warning
+to stderr.
+
+### Reload / status
+
+After install, the harness needs its MCP configuration reloaded. Reload commands
+per harness:
+
+| Harness | Reload command |
+|---------|---------------|
+| `claude-code` | `Ctrl+Shift+P` → "Reload Window" (VS Code) |
+| `opencode` | Restart the process or send `Ctrl+R` |
+| `oh-my-pi` | `/mcp reload` in the agent console |
+| `pi` | `/mcp reload` in the agent console |
+
+The Pi harness additionally requires `pi install npm:pi-mcp-extension` as a
+one-time prerequisite; the JEV installer does not install this third-party
+extension.
 
 ## Decision API
 
