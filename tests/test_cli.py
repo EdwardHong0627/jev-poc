@@ -615,6 +615,11 @@ class TestUninstallReportStatus:
 class TestInstallCredentialReadiness:
     """Credential readiness: check before mutation; prompt interactively; fail noninteractively."""
 
+    @pytest.fixture(autouse=True)
+    def _run_outside_repository_dotenv(self, tmp_path, monkeypatch):
+        """Prevent a developer's repository .env from satisfying credential lookup."""
+        monkeypatch.chdir(tmp_path)
+
     def test_install_with_token_env_succeeds(self, runner, tmp_path):
         """Install succeeds when JEV_API_TOKEN is set."""
         project = tmp_path / "proj"
