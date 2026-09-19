@@ -11,3 +11,9 @@ wheels/
 .env
 .env.*
 *.env
+
+# Local agent-harness skill installations; `.agents/` is the tracked source.
+.claude/
+.omp/
+.pi/
+.worktrees/

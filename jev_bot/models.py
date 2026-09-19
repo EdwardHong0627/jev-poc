@@ -57,23 +57,9 @@ class ScoreQuestion:
 class NoulQuestion:
     instructions: str
     type: str = "noul"
-    criteria: dict[str, str] | None = None
-
-    def __post_init__(self) -> None:
-        if self.criteria is not None:
-            if len(self.criteria) < 1 or len(self.criteria) > 16:
-                raise DecisionsError("NoulQuestion requires between 1 and 16 criteria")
-            for key, desc in self.criteria.items():
-                if not isinstance(key, str) or not key.strip():
-                    raise DecisionsError("NoulQuestion criteria keys must be non-empty strings")
-                if not isinstance(desc, str) or not desc.strip():
-                    raise DecisionsError("NoulQuestion criteria values must be non-empty strings")
 
     def to_dict(self) -> dict[str, Any]:
-        result: dict[str, Any] = {"type": self.type, "instructions": self.instructions}
-        if self.criteria is not None:
-            result["criteria"] = dict(self.criteria)
-        return result
+        return {"type": self.type, "instructions": self.instructions}
 
 
 Question = ChoiceQuestion | ScoreQuestion | NoulQuestion

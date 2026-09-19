@@ -56,7 +56,7 @@ Three question types are supported:
 |------------|----------------------------------------|---------------------|
 | `choice`   | `instructions` + `criteria` (2–16 key→desc) | `choiceResult` with `choice`, `probabilities`, `confidence` |
 | `score`    | `instructions` + `criteria` (2–16 strings) | `scoreResult` with `score`, `confidence`, `extra` |
-| `noul`     | `instructions` (optionally `criteria` 1–16 key→desc) | `noulResult` with `noul`, optional `confidence` |
+| `noul`     | `instructions` (no `criteria`)              | `noulResult` with `noul`, optional `confidence` |
 
 ### Building a request
 
@@ -79,7 +79,6 @@ request = JEVRequest(
         ),
         "risk": NoulQuestion(
             instructions="How risky is this?",
-            criteria={"low": "Low risk", "high": "High risk"},
         ),
     },
 )
@@ -156,3 +155,17 @@ MCP output includes `type` and `confidence` on each answer entry.
 `choice` results always include `confidence`; `score` results always include
 `confidence`; `noul` results include `confidence` only when the API provides
 it.
+
+### Investigation logging
+
+To retain successful MCP requests and responses for later investigation, opt in
+with an explicit database path:
+
+```sh
+uv run python -m jev_mcp.server --sqlite-db ./investigations.sqlite3
+```
+
+Each successful `jev_decide` call, including a batch of questions, appends one
+row containing its UTC timestamp, validated request, and shaped response.
+Omit `--sqlite-db` to disable logging. Validation, API, response-shaping, and
+storage failures are never recorded.

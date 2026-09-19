@@ -217,7 +217,7 @@ def test_request_serializes_list_state_in_payload() -> None:
     assert body["state"] == [1, "two"]
 
 
-# ── NEW: NoulQuestion supports optional criteria (true/false descriptions) ─
+# ── NOUL: no criteria — instructions only ─
 
 
 def test_noul_question_without_criteria() -> None:
@@ -227,36 +227,27 @@ def test_noul_question_without_criteria() -> None:
     assert q.to_dict() == {"type": "noul", "instructions": "How risky?"}
 
 
-def test_noul_question_with_criteria_dict() -> None:
-    q = NoulQuestion(
-        instructions="Rate risk",
-        criteria={"low": "Low risk", "high": "High risk"},
-    )
-    assert q.type == "noul"
-    assert q.criteria == {"low": "Low risk", "high": "High risk"}
-    d = q.to_dict()
-    assert d["type"] == "noul"
-    assert d["criteria"] == {"low": "Low risk", "high": "High risk"}
+def test_noul_question_rejects_criteria_argument() -> None:
+    """NoulQuestion must reject criteria — the endpoint expects NO criteria key."""
+    with pytest.raises(TypeError):
+        NoulQuestion(instructions="rate", criteria={"low": "Low", "high": "High"})
 
 
-def test_noul_question_rejects_empty_criteria() -> None:
-    with pytest.raises(DecisionsError):
-        NoulQuestion(instructions="rate", criteria={})
-
-
-def test_noul_question_rejects_criteria_exceeding_max() -> None:
-    with pytest.raises(DecisionsError):
-        NoulQuestion(instructions="rate", criteria={str(i): f"desc{i}" for i in range(17)})
-
-
-def test_noul_question_rejects_non_string_criteria_keys() -> None:
-    with pytest.raises(DecisionsError):
-        NoulQuestion(instructions="rate", criteria={1: "one"})
-
-
-def test_noul_question_rejects_blank_criteria_values() -> None:
-    with pytest.raises(DecisionsError):
-        NoulQuestion(instructions="rate", criteria={"key": ""})
+def test_noul_request_has_no_criteria_key() -> None:
+    """A NOUL question must serialize without a 'criteria' key."""
+    body = JEVRequest(
+        state="test",
+        model="test-model",
+        questions={
+            "q": NoulQuestion(instructions="How novel?"),
+            "c": ChoiceQuestion(
+                instructions="Pick one",
+                criteria={"a": "Option A", "b": "Option B"},
+            ),
+        },
+    ).to_dict()
+    assert "criteria" not in body["questions"]["q"]
+    assert "criteria" in body["questions"]["c"]
 
 
 # ── NEW: answer type field is required and validated ────────────────

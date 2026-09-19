@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+import argparse
 import asyncio
+from datetime import datetime, timezone
+import json
+from pathlib import Path
 import re
+import threading
 from typing import Any
 
 from jev_bot.client import DecisionsClient
@@ -109,12 +114,70 @@ def _redact_sensitive(text: str, config: Config) -> str:
     return redacted[:300]
 
 
+class Recorder:
+    """Append successful MCP invocations to one SQLite database."""
+
+    def __init__(self, connection: Any) -> None:
+        self._connection: Any | None = connection
+        self._lock = threading.Lock()
+
+    def log(self, request: dict[str, Any], response: dict[str, Any]) -> None:
+        request_json = json.dumps(
+            request, separators=(",", ":"), ensure_ascii=False, sort_keys=True
+        )
+        response_json = json.dumps(
+            response, separators=(",", ":"), ensure_ascii=False, sort_keys=True
+        )
+        with self._lock:
+            if self._connection is None:
+                raise RuntimeError("Recorder is closed")
+            try:
+                self._connection.execute(
+                    "INSERT INTO investigations (timestamp, request, response) "
+                    "VALUES (?, ?, ?)",
+                    (datetime.now(timezone.utc).isoformat(), request_json, response_json),
+                )
+                self._connection.commit()
+            except Exception:
+                self._connection.rollback()
+                raise
+
+    def close(self) -> None:
+        with self._lock:
+            if self._connection is not None:
+                self._connection.close()
+                self._connection = None
+
+
+def _startup_sqlite(path: str) -> Recorder:
+    database_path = Path(path)
+    if not path.strip() or not database_path.parent.is_dir():
+        raise ValueError("SQLite database parent directory does not exist")
+    import sqlite3
+
+    connection = sqlite3.connect(database_path, check_same_thread=False)
+    try:
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS investigations ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "timestamp TEXT NOT NULL, request TEXT NOT NULL, response TEXT NOT NULL)"
+        )
+        connection.commit()
+    except Exception:
+        connection.close()
+        raise
+    return Recorder(connection)
+
+
 # ---------------------------------------------------------------------------
 # Tool factory — builds the *jev_decide* tool function
 # ---------------------------------------------------------------------------
 
-
-def _build_decide_tool(client: DecisionsClient, config: Config | None = None) -> Any:
+def _build_decide_tool(
+    client: DecisionsClient,
+    config: Config | None = None,
+    recorder: Recorder | None = None,
+) -> Any:
     """Return the function that will be registered as the *jev_decide* tool."""
     if config is None:
         config = client._config  # noqa: SLF001
@@ -128,8 +191,9 @@ def _build_decide_tool(client: DecisionsClient, config: Config | None = None) ->
         *state* – free-text context (non-blank, ≤ 8 000 chars).
         *questions* – 1–8 question map keyed by name (regex
         ``^[A-Za-z][A-Za-z0-9_]{0,63}$``).  Each value is a dict with
-        required non-blank ``instructions`` (≤ 2000 chars) and
-        required ``criteria`` (2–16 entries):
+        required non-blank ``instructions`` (≤ 2000 chars).
+        ``criteria`` is required for ``choice`` (2–16 key→desc dict) and
+        ``score`` (2–16 string list), but NOT for ``noul``:
 
         * ``choice`` – criteria dict of non-blank key→description pairs.
         * ``score`` – criteria list of non-blank strings.
@@ -310,8 +374,16 @@ def _build_decide_tool(client: DecisionsClient, config: Config | None = None) ->
                 raise DecisionsError(
                     f"Unexpected answer type for question {name!r}"
                 )
-
-        return {"answers": answers}
+        result = {"answers": answers}
+        if recorder is not None:
+            try:
+                await asyncio.to_thread(recorder.log, request.to_dict(), result)
+            except Exception as exc:
+                raise DecisionsError(
+                    f"[storage] Investigation log: "
+                    f"{_redact_sensitive(f'{type(exc).__name__}: {exc}', config)}"
+                ) from exc
+        return result
 
     return jev_decide
 
@@ -324,6 +396,7 @@ def _build_decide_tool(client: DecisionsClient, config: Config | None = None) ->
 def create_server(
     client: DecisionsClient | None = None,
     config: Config | None = None,
+    recorder: Recorder | None = None,
 ) -> MCPServer:
     """Create an MCP server with a *jev_decide* tool.
 
@@ -349,7 +422,7 @@ def create_server(
         decisions_client = DecisionsClient(effective_config)
         should_close = True
 
-    decide_fn = _build_decide_tool(decisions_client, effective_config)
+    decide_fn = _build_decide_tool(decisions_client, effective_config, recorder)
     server.add_tool(decide_fn, name="jev_decide", title="jev_decide")
 
     if should_close:
@@ -360,11 +433,15 @@ def create_server(
             try:
                 old_run(transport, **kwargs)
             finally:
+                if recorder is not None:
+                    try:
+                        recorder.close()
+                    except Exception:
+                        pass
                 try:
                     decisions_client.close()
                 except Exception:
                     pass
-
         server.run = _run_with_shutdown  # type: ignore[assignment]
 
     return server
@@ -372,8 +449,14 @@ def create_server(
 
 def main() -> None:
     """Entry point: start the MCP stdio server."""
-    server = create_server()
-    server.run()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--sqlite-db")
+    args = parser.parse_args()
+    try:
+        recorder = _startup_sqlite(args.sqlite_db) if args.sqlite_db else None
+    except Exception as exc:
+        parser.error(f"SQLite investigation database unavailable: {exc}")
+    create_server(recorder=recorder).run()
 
 
 if __name__ == "__main__":
