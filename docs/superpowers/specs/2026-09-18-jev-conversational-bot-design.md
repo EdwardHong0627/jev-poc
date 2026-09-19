@@ -156,19 +156,6 @@ Model: `~typesafe/jev-latest`.
 - Config is read once at startup; missing token raises a clear `EnvironmentError`
   before the loop starts. Token is never exposed in responses or error text.
 
-## Framework Criteria (static package configuration)
-
-The `questions.framework.criteria` block is authored once in the package and sent
-verbatim every request. It enumerates the closed candidate set JEV selects from:
-
-| Key | Description |
-|-----|-------------|
-| `custom` | Custom application from scratch; maximum control, highest engineering cost. |
-| `openwebui` | Open WebUI interface; ready-made chat experience, less control over workflow. |
-| `chainlit` | Python-native conversational UI; fast to build a purpose-specific bot. |
-| `gradio` | Rapid browser chatbot prototype; minimal setup, suitable for demos. |
-| `streamlit` | Internal decision-support app with chat and forms; strong for business tools. |
-| `fastapi_react` | FastAPI backend with a React frontend; production-oriented and fully customizable. |
 
 ## Validation & Error Behavior
 

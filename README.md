@@ -229,3 +229,34 @@ MCP output includes `type` and `confidence` on each answer entry.
 `choice` results always include `confidence`; `score` results always include
 `confidence`; `noul` results include `confidence` only when the API provides
 it.
+
+### Investigation logging
+
+MCP users opt in by adding `--sqlite-db` and an absolute database path to the
+JEV server's configured argument list. For example, a local development
+registration is:
+
+```json
+{
+  "mcpServers": {
+    "jev": {
+      "type": "stdio",
+      "command": "uv",
+      "args": [
+        "run",
+        "python",
+        "-m",
+        "jev_mcp.server",
+        "--sqlite-db",
+        "/absolute/path/jev-investigations.sqlite3"
+      ]
+    }
+  }
+}
+```
+
+The server creates the database and appends one row for every successful
+`jev_decide` invocation, including a batch of questions. Each row contains an
+offset-aware UTC timestamp, the validated request, and the shaped response.
+Omit both arguments to disable persistence. Validation, API, response-shaping,
+and storage failures are never recorded.
