@@ -46,6 +46,57 @@ jev config unset endpoint              # remove stored endpoint
 Valid harness names: `claude-code`, `opencode`, `oh-my-pi`, `pi`. Exactly one
 of `--project` or `--user` is required for install/uninstall.
 
+### First-install credential UX
+
+When running `jev install`, the command checks for a JEV API token through the
+same precedence chain as the runtime client: process environment (`JEV_API_TOKEN`),
+project `.env`, then the secure user config store at
+`$XDG_CONFIG_HOME/jev-poc/config.json`.
+
+**When a token is already resolved** from any source, installation proceeds
+without prompting.
+
+**When no token is found and stdin is a terminal**, the user is prompted once
+with hidden input:
+
+```
+$ jev install oh-my-pi --project /path/to/project
+JEV API token: ··················
+Installed: /path/to/project/.omp/skills/using-jev-decisions/SKILL.md
+MCP config: /path/to/project/.omp/mcp.json
+```
+
+The interactively entered token is stored securely (mode `0600`) alongside the
+default OpenRouter Decisions endpoint
+(`https://openrouter.ai/api/alpha/decisions`). Blank input is rejected before
+any skills or MCP configuration are written.
+
+**When no token is found and stdin is not a terminal** (CI, piping, scripts),
+the command fails immediately with guidance — no prompt appears and no
+installation mutation occurs:
+
+```
+$ jev install oh-my-pi --project /path/to/project | cat
+Error: no JEV API token found.
+
+Set the JEV_API_TOKEN environment variable or run:
+  jev config set token --stdin
+to store a token before installing.
+```
+
+**Preventing the prompt in future sessions:**
+
+```sh
+# Set via environment (ephemeral — not persisted)
+export JEV_API_TOKEN="sk-or-v1-..."
+
+# Set via CLI (persisted securely to config.json)
+jev config set token --stdin
+```
+
+The token is never written to harness configuration files or echoed to
+standard output.
+
 ### What install does
 
 Each `jev install` command performs two operations:
