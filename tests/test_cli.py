@@ -462,28 +462,31 @@ class TestMcpConsoleEntry:
 
 
 class TestInstallHelpMcpDescription:
-    def test_install_help_mentions_mcp(self, runner):
+    def test_install_help_mentions_mcp_registration(self, runner):
         result = runner.invoke(app, ["install", "--help"])
         assert result.exit_code == 0
-        assert "mcp" in result.output.lower() or "skill" in result.output.lower()
+        assert "MCP registration" in result.output
 
-    def test_install_help_mentions_both_targets(self, runner):
+    def test_install_help_mentions_skill(self, runner):
         result = runner.invoke(app, ["install", "--help"])
         assert result.exit_code == 0
-        # Help should describe that both skill and MCP config are managed
         assert "skill" in result.output.lower()
 
 
 # ---------------------------------------------------------------------------
-# 21. CLI uninstall help describes FOREIGN warning
+# 21. CLI uninstall help describes skill-plus-MCP behavior
 # ---------------------------------------------------------------------------
 
 
-class TestUninstallHelpForeignWarning:
-    def test_uninstall_help_mentions_foreign(self, runner):
+class TestUninstallHelpMcpDescription:
+    def test_uninstall_help_mentions_mcp_registration(self, runner):
         result = runner.invoke(app, ["uninstall", "--help"])
         assert result.exit_code == 0
-        # Help should describe that unrelated MCP entries may be retained
+        assert "MCP registration" in result.output
+
+    def test_uninstall_help_mentions_skill(self, runner):
+        result = runner.invoke(app, ["uninstall", "--help"])
+        assert result.exit_code == 0
         assert "skill" in result.output.lower()
 
 
@@ -498,22 +501,22 @@ class TestInstallOutputShowsBothPaths:
         project.mkdir()
         result = runner.invoke(app, ["install", "claude-code", "--project", str(project)])
         assert result.exit_code == 0, f"stdout={result.output} stderr={result.stderr}"
-        # Output should contain both the skill path and the MCP config path
-        lines = [l.strip() for l in result.output.strip().splitlines()]
-        # At least two distinct path lines (skill + MCP config)
-        path_lines = [l for l in lines if Path(l.lstrip()).is_absolute() or "." in l.lower() and ("/" in l or "\\" in l)]
-        assert len(path_lines) >= 1, (
-            f"Install output should show the skill path: {result.output!r}"
-        )
         # Verify skill path is present
         skill_expected = str(project / ".claude" / "skills" / "using-jev-decisions" / "SKILL.md")
         assert skill_expected in result.output, (
             f"Install output should include skill path {skill_expected!r}. Got: {result.output!r}"
         )
         # Verify MCP config path is present (.mcp.json for claude-code project scope)
-        assert ".mcp.json" in result.output, (
-            f"Install output should include MCP config path. Got: {result.output!r}"
-        )
+        assert "MCP config:" in result.output
+        assert ".mcp.json" in result.output
+
+    def test_install_output_two_lines(self, runner, tmp_path):
+        project = tmp_path / "proj"
+        project.mkdir()
+        result = runner.invoke(app, ["install", "claude-code", "--project", str(project)])
+        assert result.exit_code == 0
+        lines = [l for l in result.output.strip().splitlines() if l.strip()]
+        assert len(lines) == 2, f"Expected 2 output lines, got {len(lines)}: {lines!r}"
 
 
 # ---------------------------------------------------------------------------
@@ -522,8 +525,8 @@ class TestInstallOutputShowsBothPaths:
 
 
 class TestUninstallForeignWarning:
-    def test_uninstall_foreign_shows_warning(self, runner, tmp_path):
-        """When a foreign MCP entry exists, uninstall warns without removing it."""
+    def test_uninstall_foreign_shows_warning_exact(self, runner, tmp_path):
+        """When a foreign MCP entry exists, uninstall warns with exact wording."""
         import json
         project = tmp_path / "proj"
         project.mkdir()
@@ -531,19 +534,21 @@ class TestUninstallForeignWarning:
         skill_md = project / ".claude" / "skills" / "using-jev-decisions" / "SKILL.md"
         skill_md.parent.mkdir(parents=True)
         skill_md.write_text("# JEV skill\n")
-        # Create a foreign MCP config
-        config_path = project / ".claude" / "commands.json"
+        # Create a foreign MCP config — jev entry with different content
+        config_path = project / ".mcp.json"
         config_path.write_text(json.dumps({
-            "commands": [
-                {"name": "jev", "command": "some-other-server", "description": "not jev"},
-            ]
+            "mcpServers": {
+                "jev": {"command": "some-other-server", "description": "not jev"}
+            }
         }), encoding="utf-8")
 
         result = runner.invoke(app, ["uninstall", "claude-code", "--project", str(project)])
         assert result.exit_code == 0, f"stdout={result.output} stderr={result.stderr}"
-        # Output should mention FOREIGN / retained
-        assert "uninstalled" in result.output.lower()
-        assert "foreign" in result.output.lower() or "retained" in result.output.lower() or "warning" in result.output.lower() or "config" in result.output.lower()
+        # Skill was removed
+        assert "Uninstalled:" in result.output
+        assert "Uninstalled:" in result.output.splitlines()[0]
+        # Foreign warning on stderr
+        assert "Warning: foreign MCP registration retained." in result.stderr
 
 
 # ---------------------------------------------------------------------------
@@ -552,11 +557,13 @@ class TestUninstallForeignWarning:
 
 
 class TestForceHelpMcp:
-    def test_force_help_mentions_mcp_registration(self, runner):
+    def test_force_help_mentions_replace_foreign_mcp(self, runner):
         result = runner.invoke(app, ["install", "--help"])
         assert result.exit_code == 0
-        # --force should mention MCP registration, not just skill
-        assert "force" in result.output.lower()
+        # Typer renders help in a box-drawing table; strip box chars + whitespace
+        import re
+        cleaned = re.sub(r"[│╭╮╰──·●\s]+", " ", result.output)
+        assert "replace a foreign JEV MCP registration" in cleaned
 
 
 # ---------------------------------------------------------------------------
@@ -576,6 +583,17 @@ class TestUninstallReportStatus:
         result = runner.invoke(app, ["uninstall", "claude-code", "--project", str(project)])
         assert result.exit_code == 0, f"stdout={result.output} stderr={result.stderr}"
         # Verify config path is in output (uninstall removes skill + MCP config)
-        assert ".mcp.json" in result.output, (
-            f"Uninstall output should include MCP config path. Got: {result.output!r}"
-        )
+        assert "MCP config:" in result.output
+        assert ".mcp.json" in result.output
+
+    def test_uninstall_normal_status_no_stderr_warning(self, runner, tmp_path):
+        """When MCP config is canonical (not foreign), no warning on stderr."""
+        project = tmp_path / "proj"
+        project.mkdir()
+        skill_md = project / ".claude" / "skills" / "using-jev-decisions" / "SKILL.md"
+        skill_md.parent.mkdir(parents=True)
+        skill_md.write_text("# JEV skill\n")
+
+        result = runner.invoke(app, ["uninstall", "claude-code", "--project", str(project)])
+        assert result.exit_code == 0
+        assert "Warning" not in result.stderr
