@@ -12,6 +12,7 @@ from typer.testing import CliRunner
 
 from jev_bot.cli import app
 from jev_bot.config_store import get_config_path
+from unittest.mock import patch
 
 
 # ---------------------------------------------------------------------------
@@ -46,6 +47,13 @@ def isolated_config(config_dir, monkeypatch):
     """Point XDG_CONFIG_HOME at tmp_path/config for every test."""
     monkeypatch.setenv("XDG_CONFIG_HOME", str(config_dir))
     return config_dir
+
+
+@pytest.fixture()
+def install_credential(monkeypatch):
+    """Provide a JEV_API_TOKEN so install does not block credential check."""
+    monkeypatch.setenv("JEV_API_TOKEN", "test-token-for-tests")
+    return None
 
 
 @pytest.fixture()
@@ -201,7 +209,7 @@ class TestConfigUnset:
 
 
 class TestInstallProjectScope:
-    def test_install_claude_code_project(self, runner, tmp_path):
+    def test_install_claude_code_project(self, runner, tmp_path, install_credential):
         project = tmp_path / "proj"
         project.mkdir()
         result = runner.invoke(app, ["install", "claude-code", "--project", str(project)])
@@ -211,7 +219,7 @@ class TestInstallProjectScope:
         skill_md = project / ".claude" / "skills" / "using-jev-decisions" / "SKILL.md"
         assert skill_md.is_file()
 
-    def test_install_opencode_project(self, runner, tmp_path):
+    def test_install_opencode_project(self, runner, tmp_path, install_credential):
         project = tmp_path / "proj"
         project.mkdir()
         result = runner.invoke(app, ["install", "opencode", "--project", str(project)])
@@ -219,7 +227,7 @@ class TestInstallProjectScope:
         skill_md = project / ".opencode" / "skills" / "using-jev-decisions" / "SKILL.md"
         assert skill_md.is_file()
 
-    def test_install_oh_my_pi_project(self, runner, tmp_path):
+    def test_install_oh_my_pi_project(self, runner, tmp_path, install_credential):
         project = tmp_path / "proj"
         project.mkdir()
         result = runner.invoke(app, ["install", "oh-my-pi", "--project", str(project)])
@@ -227,7 +235,7 @@ class TestInstallProjectScope:
         skill_md = project / ".omp" / "skills" / "using-jev-decisions" / "SKILL.md"
         assert skill_md.is_file()
 
-    def test_install_pi_project(self, runner, tmp_path):
+    def test_install_pi_project(self, runner, tmp_path, install_credential):
         project = tmp_path / "proj"
         project.mkdir()
         result = runner.invoke(app, ["install", "pi", "--project", str(project)])
@@ -242,7 +250,7 @@ class TestInstallProjectScope:
 
 
 class TestInstallUserScope:
-    def test_install_claude_code_user(self, runner, tmp_path):
+    def test_install_claude_code_user(self, runner, tmp_path, install_credential):
         home = tmp_path / "home"
         home.mkdir()
         result = runner.invoke(app, ["install", "claude-code", "--user", str(home)])
@@ -250,7 +258,7 @@ class TestInstallUserScope:
         skill_md = home / ".claude" / "skills" / "using-jev-decisions" / "SKILL.md"
         assert skill_md.is_file()
 
-    def test_install_opencode_user(self, runner, tmp_path):
+    def test_install_opencode_user(self, runner, tmp_path, install_credential):
         home = tmp_path / "home"
         home.mkdir()
         result = runner.invoke(app, ["install", "opencode", "--user", str(home)])
@@ -265,7 +273,7 @@ class TestInstallUserScope:
 
 
 class TestInstallForce:
-    def test_force_overwrites_existing(self, runner, tmp_path):
+    def test_force_overwrites_existing(self, runner, tmp_path, install_credential):
         project = tmp_path / "proj"
         project.mkdir()
         skill_dir = project / ".claude" / "skills" / "using-jev-decisions"
@@ -284,7 +292,7 @@ class TestInstallForce:
 
 
 class TestInstallIdempotent:
-    def test_second_install_succeeds(self, runner, tmp_path):
+    def test_second_install_succeeds(self, runner, tmp_path, install_credential):
         project = tmp_path / "proj"
         project.mkdir()
         result1 = runner.invoke(app, ["install", "claude-code", "--project", str(project)])
@@ -496,7 +504,7 @@ class TestUninstallHelpMcpDescription:
 
 
 class TestInstallOutputShowsBothPaths:
-    def test_install_output_includes_mcp_config_path(self, runner, tmp_path):
+    def test_install_output_includes_mcp_config_path(self, runner, tmp_path, install_credential):
         project = tmp_path / "proj"
         project.mkdir()
         result = runner.invoke(app, ["install", "claude-code", "--project", str(project)])
@@ -510,7 +518,7 @@ class TestInstallOutputShowsBothPaths:
         assert "MCP config:" in result.output
         assert ".mcp.json" in result.output
 
-    def test_install_output_two_lines(self, runner, tmp_path):
+    def test_install_output_two_lines(self, runner, tmp_path, install_credential):
         project = tmp_path / "proj"
         project.mkdir()
         result = runner.invoke(app, ["install", "claude-code", "--project", str(project)])
@@ -597,3 +605,126 @@ class TestUninstallReportStatus:
         result = runner.invoke(app, ["uninstall", "claude-code", "--project", str(project)])
         assert result.exit_code == 0
         assert "Warning" not in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# 26. install — credential readiness check
+# ---------------------------------------------------------------------------
+
+
+class TestInstallCredentialReadiness:
+    """Credential readiness: check before mutation; prompt interactively; fail noninteractively."""
+
+    @pytest.fixture(autouse=True)
+    def _run_outside_repository_dotenv(self, tmp_path, monkeypatch):
+        """Prevent a developer's repository .env from satisfying credential lookup."""
+        monkeypatch.chdir(tmp_path)
+
+    def test_install_with_token_env_succeeds(self, runner, tmp_path):
+        """Install succeeds when JEV_API_TOKEN is set."""
+        project = tmp_path / "proj"
+        project.mkdir()
+        result = runner.invoke(
+            app,
+            ["install", "claude-code", "--project", str(project)],
+            env={"JEV_API_TOKEN": "test-token"},
+        )
+        assert result.exit_code == 0, f"stdout={result.output} stderr={result.stderr}"
+        assert "Installed:" in result.output
+
+    def test_install_with_stored_token_succeeds(self, runner, tmp_path, config_path, install_credential, monkeypatch):
+        """Install succeeds when token is stored in config (not env)."""
+        project = tmp_path / "proj"
+        project.mkdir()
+        # Remove the env var fixture so we actually test the config-store path.
+        monkeypatch.delenv("JEV_API_TOKEN", raising=False)
+        config_path.write_text(
+            json.dumps({
+                "token": "stored-token",
+                "endpoint": "https://openrouter.ai/api/alpha/decisions",
+            }),
+            encoding="utf-8",
+        )
+        result = runner.invoke(
+            app,
+            ["install", "claude-code", "--project", str(project)],
+        )
+        assert result.exit_code == 0, f"stdout={result.output} stderr={result.stderr}"
+        assert "Installed:" in result.output
+
+    def test_install_no_token_interactive_prompts(self, runner, tmp_path, config_path, install_credential, monkeypatch):
+        """When no token exists and stdin is a TTY, install prompts and persists."""
+        project = tmp_path / "proj"
+        project.mkdir()
+        # Remove the env var so load_config fails, triggering the prompt path
+        monkeypatch.delenv("JEV_API_TOKEN", raising=False)
+        monkeypatch.setattr("jev_bot.cli._force_interactive_for_testing", True)
+        result = runner.invoke(
+            app,
+            ["install", "claude-code", "--project", str(project)],
+            input="prompted-token\n",
+        )
+        assert result.exit_code == 0, f"stdout={result.output} stderr={result.stderr}"
+        assert "Installed:" in result.output
+        stored = json.loads(config_path.read_text(encoding="utf-8"))
+        assert stored["token"] == "prompted-token"
+        assert stored["endpoint"] == "https://openrouter.ai/api/alpha/decisions"
+
+    def test_install_no_token_blank_stdin_rejected(self, runner, tmp_path, install_credential, monkeypatch):
+        """Blank input during interactive prompt is rejected."""
+        project = tmp_path / "proj"
+        project.mkdir()
+        monkeypatch.delenv("JEV_API_TOKEN", raising=False)
+        monkeypatch.setattr("jev_bot.cli._force_interactive_for_testing", True)
+        result = runner.invoke(
+            app,
+            ["install", "claude-code", "--project", str(project)],
+            input="\n",
+        )
+        assert result.exit_code == 1
+        # Typer re-prompts on blank input then aborts; either way, it's a failure
+        assert "Aborted" in result.output or "non-blank" in result.output or "Error" in result.output.lower()
+
+    def test_install_no_token_noninteractive_fails(self, runner, tmp_path, config_path, install_credential, monkeypatch):
+        """Noninteractive stdin (no TTY) fails before mutation."""
+        project = tmp_path / "proj"
+        project.mkdir()
+        monkeypatch.delenv("JEV_API_TOKEN", raising=False)
+        # _force_interactive_for_testing is False by default (autouse fixture sets it)
+        result = runner.invoke(
+            app,
+            ["install", "claude-code", "--project", str(project)],
+            input=None,
+        )
+        assert result.exit_code == 1
+        assert "JEV_API_TOKEN" in result.output or "config" in result.output.lower()
+        skill_md = project / ".claude" / "skills" / "using-jev-decisions" / "SKILL.md"
+        assert not skill_md.exists()
+        assert not config_path.exists() or json.loads(config_path.read_text(encoding="utf-8")).get("token") != ""
+
+    def test_install_no_token_no_output_token(self, runner, tmp_path, config_path, install_credential, monkeypatch):
+        """Token value never appears in CLI output, even on success."""
+        project = tmp_path / "proj"
+        project.mkdir()
+        monkeypatch.delenv("JEV_API_TOKEN", raising=False)
+        monkeypatch.setattr("jev_bot.cli._force_interactive_for_testing", True)
+        result = runner.invoke(
+            app,
+            ["install", "claude-code", "--project", str(project)],
+            input="secret-token-value\n",
+        )
+        assert result.exit_code == 0
+        assert "secret-token-value" not in result.output
+
+    def test_install_output_no_token_exposure_interactive_fail(self, runner, tmp_path, install_credential, monkeypatch):
+        """Token never exposed in failure output either."""
+        project = tmp_path / "proj"
+        project.mkdir()
+        monkeypatch.delenv("JEV_API_TOKEN", raising=False)
+        monkeypatch.setattr("jev_bot.cli._force_interactive_for_testing", True)
+        result = runner.invoke(
+            app,
+            ["install", "claude-code", "--project", str(project)],
+            input="\n",
+        )
+        assert "secret" not in result.output.lower() or "prompted" not in result.output

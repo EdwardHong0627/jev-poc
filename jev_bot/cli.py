@@ -15,6 +15,7 @@ from jev_bot.config_store import (
     read_user_config,
     write_user_config,
 )
+from jev_bot.config import DEFAULT_ENDPOINT, load_config
 from jev_bot.installer import (
     install as _install,
     install_with_report,
@@ -58,6 +59,67 @@ def _write_raw_json(config_dir: Path, data: dict) -> None:
 
     os.replace(tmp_path, config_path)
     os.chmod(config_path, 0o600)
+
+
+# ------------------------------------------------------------------ credential readiness
+
+# Module-level flag for testing: when True, treat all installs as interactive.
+_force_interactive_for_testing: bool = False
+
+
+def _ensure_credential_for_install(config_dir: Path) -> None:
+    """Ensure a JEV API token is available before install.
+
+    Checks existing credential sources (env → config store).  When no token is
+    found and stdin is a terminal, prompts the user once via hidden input;
+    rejects blank, then persists the token (plus DEFAULT_ENDPOINT) to the
+    config store.  When no token is found and stdin is *not* a terminal,
+    prints guidance and exits non-zero *before* any install mutation.
+
+    Does NOT write the token value to stdout or harness config.
+    """
+    # Allow test harness to force interactive mode (Typer's CliRunner
+    # replaces sys.stdin, so isatty() always reports False in tests).
+    is_interactive = _force_interactive_for_testing or sys.stdin.isatty()
+
+    try:
+        load_config()
+        return  # token already available
+    except EnvironmentError:
+        pass
+
+    if is_interactive:
+        # Interactive: prompt once, reject blank, persist
+        prompt = typer.prompt(
+            "JEV API token",
+            type=str,
+            hide_input=True,
+            show_default=False,
+        )
+        if not prompt:
+            typer.echo(
+                "Error: token must be a non-blank value.", err=True,
+            )
+            raise SystemExit(1)
+
+        try:
+            cfg = UserConfig(token=prompt, endpoint=DEFAULT_ENDPOINT)
+        except ValueError as exc:
+            typer.echo(f"Error: {exc}", err=True)
+            raise SystemExit(1)
+
+        config_path = get_config_path()
+        write_user_config(config_dir, cfg)
+    else:
+        # Non-interactive: fail with guidance, no mutation
+        typer.echo(
+            "Error: no JEV API token found.\n\n"
+            "Set the JEV_API_TOKEN environment variable or run:\n"
+            "  jev config set token --stdin\n"
+            "to store a token before installing.",
+            err=True,
+        )
+        raise SystemExit(1)
 
 
 # ------------------------------------------------------------------ config
@@ -238,6 +300,8 @@ def install(
             "Error: provide exactly one of --project or --user, not both.", err=True,
         )
         raise SystemExit(1)
+
+    _ensure_credential_for_install(get_config_path().parent)
 
     try:
         skill_path, mcp_result = install_with_report(
