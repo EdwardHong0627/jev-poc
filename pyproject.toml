@@ -25,6 +25,7 @@ dev = [
 
 [project.scripts]
 jev = "jev_bot.cli:app"
+jev-mcp = "jev_mcp.server:main"
 
 [tool.setuptools.package-data]
 jev_bot = ["assets/**/*"]
