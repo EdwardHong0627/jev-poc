@@ -3,7 +3,7 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["jev_bot*"]
+include = ["jev_bot*", "jev_mcp*"]
 
 [project]
 name = "jev-poc"
@@ -12,11 +12,20 @@ description = "Reusable OpenRouter JEV Decisions API client and conversational C
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "mcp>=1.12.0",
     "python-dotenv>=1.0.0",
     "requests>=2.34.2",
+    "typer>=0.12.0",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0.0",
 ]
+
+[project.scripts]
+jev = "jev_bot.cli:app"
+jev-mcp = "jev_mcp.server:main"
+
+[tool.setuptools.package-data]
+jev_bot = ["assets/**/*"]
