@@ -158,14 +158,31 @@ it.
 
 ### Investigation logging
 
-To retain successful MCP requests and responses for later investigation, opt in
-with an explicit database path:
+MCP users opt in by adding `--sqlite-db` and an absolute database path to the
+JEV server's configured argument list. For example, a local development
+registration is:
 
-```sh
-uv run python -m jev_mcp.server --sqlite-db ./investigations.sqlite3
+```json
+{
+  "mcpServers": {
+    "jev": {
+      "type": "stdio",
+      "command": "uv",
+      "args": [
+        "run",
+        "python",
+        "-m",
+        "jev_mcp.server",
+        "--sqlite-db",
+        "/absolute/path/jev-investigations.sqlite3"
+      ]
+    }
+  }
+}
 ```
 
-Each successful `jev_decide` call, including a batch of questions, appends one
-row containing its UTC timestamp, validated request, and shaped response.
-Omit `--sqlite-db` to disable logging. Validation, API, response-shaping, and
-storage failures are never recorded.
+The server creates the database and appends one row for every successful
+`jev_decide` invocation, including a batch of questions. Each row contains an
+offset-aware UTC timestamp, the validated request, and the shaped response.
+Omit both arguments to disable persistence. Validation, API, response-shaping,
+and storage failures are never recorded.
