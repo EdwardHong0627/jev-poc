@@ -518,13 +518,32 @@ class TestInstallOutputShowsBothPaths:
         assert "MCP config:" in result.output
         assert ".mcp.json" in result.output
 
-    def test_install_output_two_lines(self, runner, tmp_path, install_credential):
+    def test_install_output_three_lines(self, runner, tmp_path, install_credential):
+        from jev_bot.investigation_logging import resolve_sqlite_db_path
+
         project = tmp_path / "proj"
         project.mkdir()
         result = runner.invoke(app, ["install", "claude-code", "--project", str(project)])
-        assert result.exit_code == 0
+        assert result.exit_code == 0, f"stdout={result.output} stderr={result.stderr}"
         lines = [l for l in result.output.strip().splitlines() if l.strip()]
-        assert len(lines) == 2, f"Expected 2 output lines, got {len(lines)}: {lines!r}"
+        assert len(lines) == 3, f"Expected 3 output lines, got {len(lines)}: {lines!r}"
+        assert lines[0].startswith("Installed: ")
+        assert lines[1].startswith("MCP config: ")
+        expected_db = resolve_sqlite_db_path(project_root=project)
+        assert lines[2] == f"SQLite recording: enabled ({expected_db})"
+
+    def test_install_output_three_lines_disabled(self, runner, tmp_path, install_credential):
+        project = tmp_path / "proj"
+        project.mkdir()
+        result = runner.invoke(
+            app, ["install", "claude-code", "--project", str(project), "--no-db-enable"]
+        )
+        assert result.exit_code == 0, f"stdout={result.output} stderr={result.stderr}"
+        lines = [l for l in result.output.strip().splitlines() if l.strip()]
+        assert len(lines) == 3, f"Expected 3 output lines, got {len(lines)}: {lines!r}"
+        assert lines[0].startswith("Installed: ")
+        assert lines[1].startswith("MCP config: ")
+        assert lines[2] == "SQLite recording: disabled."
 
 
 # ---------------------------------------------------------------------------
@@ -662,7 +681,8 @@ class TestInstallCredentialReadiness:
         result = runner.invoke(
             app,
             ["install", "claude-code", "--project", str(project)],
-            input="prompted-token\n",
+            # Second line: Enter at the SQLite recording prompt (default yes).
+            input="prompted-token\n\n",
         )
         assert result.exit_code == 0, f"stdout={result.output} stderr={result.stderr}"
         assert "Installed:" in result.output
@@ -683,7 +703,10 @@ class TestInstallCredentialReadiness:
         )
         assert result.exit_code == 1
         # Typer re-prompts on blank input then aborts; either way, it's a failure
+        # (blank line consumes the token prompt, then EOF aborts).
         assert "Aborted" in result.output or "non-blank" in result.output or "Error" in result.output.lower()
+        skill_md = project / ".claude" / "skills" / "using-jev-decisions" / "SKILL.md"
+        assert not skill_md.exists()
 
     def test_install_no_token_noninteractive_fails(self, runner, tmp_path, config_path, install_credential, monkeypatch):
         """Noninteractive stdin (no TTY) fails before mutation."""
@@ -711,7 +734,8 @@ class TestInstallCredentialReadiness:
         result = runner.invoke(
             app,
             ["install", "claude-code", "--project", str(project)],
-            input="secret-token-value\n",
+            # Second line: Enter at the SQLite recording prompt (default yes).
+            input="secret-token-value\n\n",
         )
         assert result.exit_code == 0
         assert "secret-token-value" not in result.output
@@ -728,3 +752,214 @@ class TestInstallCredentialReadiness:
             input="\n",
         )
         assert "secret" not in result.output.lower() or "prompted" not in result.output
+
+    def test_credential_resolution_precedes_recording_prompt(self, runner, tmp_path, install_credential, monkeypatch):
+        """Blank token aborts during credential resolution; the logging prompt never shows."""
+        project = tmp_path / "proj"
+        project.mkdir()
+        monkeypatch.delenv("JEV_API_TOKEN", raising=False)
+        monkeypatch.setattr("jev_bot.cli._force_interactive_for_testing", True)
+        result = runner.invoke(
+            app,
+            ["install", "claude-code", "--project", str(project)],
+            input="\n",
+        )
+        assert result.exit_code == 1
+        assert "Record successful" not in result.output
+        assert (
+            "SQLite recording stores request state, questions, and "
+            "shaped responses verbatim." not in result.output
+        )
+        skill_md = project / ".claude" / "skills" / "using-jev-decisions" / "SKILL.md"
+        assert not skill_md.exists()
+
+
+# ---------------------------------------------------------------------------
+# 27. install — SQLite recording prompt (audit-first opt-in)
+# ---------------------------------------------------------------------------
+
+
+class TestInstallRecordingPrompt:
+    """Logging prompt only when the flag is omitted AND interactive; Enter = yes."""
+
+    PROMPT = "Record successful JEV requests and responses in SQLite?"
+    WARNING = (
+        "SQLite recording stores request state, questions, and "
+        "shaped responses verbatim."
+    )
+
+    def test_forced_interactive_enter_enables_recording(self, runner, tmp_path, install_credential, monkeypatch):
+        from jev_bot.investigation_logging import resolve_sqlite_db_path
+        from jev_bot.mcp_registration import ManagedVariant, parse_managed_entry
+
+        project = tmp_path / "proj"
+        project.mkdir()
+        monkeypatch.setattr("jev_bot.cli._force_interactive_for_testing", True)
+        result = runner.invoke(
+            app,
+            ["install", "claude-code", "--project", str(project)],
+            input="\n",  # Enter at the logging prompt -> default yes
+        )
+        assert result.exit_code == 0, f"stdout={result.output} stderr={result.stderr}"
+        assert self.PROMPT in result.output
+        # The verbatim-storage warning prints immediately before the [Y/n] confirm.
+        assert f"{self.WARNING}\n{self.PROMPT}" in result.output
+        expected_db = resolve_sqlite_db_path(project_root=project)
+        lines = [l for l in result.output.strip().splitlines() if l.strip()]
+        assert lines[-1] == f"SQLite recording: enabled ({expected_db})"
+        entry = json.loads((project / ".mcp.json").read_text(encoding="utf-8"))["mcpServers"]["jev"]
+        managed = parse_managed_entry("claude-code", entry)
+        assert managed.variant is ManagedVariant.ENABLED
+        assert managed.sqlite_db_path == expected_db
+
+    def test_forced_interactive_no_disables_recording(self, runner, tmp_path, install_credential, monkeypatch):
+        from jev_bot.mcp_registration import ManagedVariant, parse_managed_entry
+
+        project = tmp_path / "proj"
+        project.mkdir()
+        monkeypatch.setattr("jev_bot.cli._force_interactive_for_testing", True)
+        result = runner.invoke(
+            app,
+            ["install", "claude-code", "--project", str(project)],
+            input="n\n",
+        )
+        assert result.exit_code == 0, f"stdout={result.output} stderr={result.stderr}"
+        assert self.PROMPT in result.output
+        assert "SQLite recording: disabled." in result.output
+        entry = json.loads((project / ".mcp.json").read_text(encoding="utf-8"))["mcpServers"]["jev"]
+        assert "--sqlite-db" not in entry.get("args", [])
+        assert parse_managed_entry("claude-code", entry).variant is ManagedVariant.DISABLED
+
+    @pytest.mark.parametrize(
+        "flag,expect_line",
+        [
+            ("--db-enable", "SQLite recording: enabled ("),
+            ("--no-db-enable", "SQLite recording: disabled."),
+        ],
+    )
+    def test_explicit_flag_skips_prompt(self, runner, tmp_path, install_credential, monkeypatch, flag, expect_line):
+        project = tmp_path / "proj"
+        project.mkdir()
+        monkeypatch.setattr("jev_bot.cli._force_interactive_for_testing", True)
+        result = runner.invoke(
+            app,
+            ["install", "claude-code", "--project", str(project), flag],
+            input="",  # no input lines available — a prompt would abort
+        )
+        assert result.exit_code == 0, f"stdout={result.output} stderr={result.stderr}"
+        assert self.PROMPT not in result.output
+        assert self.WARNING not in result.output
+        assert expect_line in result.output
+
+    def test_noninteractive_default_no_prompt_enabled(self, runner, tmp_path, install_credential):
+        from jev_bot.investigation_logging import resolve_sqlite_db_path
+
+        project = tmp_path / "proj"
+        project.mkdir()
+        # No forced-interactive flag, input=None -> non-interactive.
+        result = runner.invoke(
+            app,
+            ["install", "claude-code", "--project", str(project)],
+            input=None,
+        )
+        assert result.exit_code == 0, f"stdout={result.output} stderr={result.stderr}"
+        assert self.PROMPT not in result.output
+        assert self.WARNING not in result.output
+        expected_db = resolve_sqlite_db_path(project_root=project)
+        assert f"SQLite recording: enabled ({expected_db})" in result.output
+
+
+# ---------------------------------------------------------------------------
+# 28. install — explicit --db-enable/--no-db-enable bypass
+# ---------------------------------------------------------------------------
+
+
+class TestInstallExplicitFlagBypass:
+    """Explicit flags never consume stdin, even in forced-interactive mode."""
+
+    PROMPT = "Record successful JEV requests and responses in SQLite?"
+    WARNING = (
+        "SQLite recording stores request state, questions, and "
+        "shaped responses verbatim."
+    )
+
+    @pytest.mark.parametrize(
+        "flag,expect_line",
+        [
+            ("--db-enable", "SQLite recording: enabled ("),
+            ("--no-db-enable", "SQLite recording: disabled."),
+        ],
+    )
+    def test_forced_interactive_explicit_flag_consumes_no_input(self, runner, tmp_path, install_credential, monkeypatch, flag, expect_line):
+        project = tmp_path / "proj"
+        project.mkdir()
+        monkeypatch.setattr("jev_bot.cli._force_interactive_for_testing", True)
+        result = runner.invoke(
+            app,
+            ["install", "claude-code", "--project", str(project), flag],
+            input="",  # zero promptable lines
+        )
+        assert result.exit_code == 0, f"stdout={result.output} stderr={result.stderr}"
+        assert self.PROMPT not in result.output
+        assert self.WARNING not in result.output
+        assert expect_line in result.output
+
+    def test_no_db_enable_twice_still_succeeds(self, runner, tmp_path, install_credential):
+        """Managed migration: a second --no-db-enable install stays exit 0."""
+        project = tmp_path / "proj"
+        project.mkdir()
+        result1 = runner.invoke(
+            app, ["install", "claude-code", "--project", str(project), "--no-db-enable"]
+        )
+        assert result1.exit_code == 0, f"stdout={result1.output} stderr={result1.stderr}"
+        result2 = runner.invoke(
+            app, ["install", "claude-code", "--project", str(project), "--no-db-enable"]
+        )
+        assert result2.exit_code == 0, f"stdout={result2.output} stderr={result2.stderr}"
+        assert "SQLite recording: disabled." in result2.output
+
+
+# ---------------------------------------------------------------------------
+# 29. install — non-interactive recording defaults
+# ---------------------------------------------------------------------------
+
+
+class TestInstallNonInteractiveRecording:
+    """Non-interactive installs never prompt; default enabled, flag wins."""
+
+    PROMPT = "Record successful JEV requests and responses in SQLite?"
+    WARNING = (
+        "SQLite recording stores request state, questions, and "
+        "shaped responses verbatim."
+    )
+
+    def test_noninteractive_default_enabled_absolute_path(self, runner, tmp_path, install_credential):
+        from jev_bot.investigation_logging import resolve_sqlite_db_path
+
+        project = tmp_path / "proj"
+        project.mkdir()
+        result = runner.invoke(
+            app, ["install", "claude-code", "--project", str(project)], input=None
+        )
+        assert result.exit_code == 0, f"stdout={result.output} stderr={result.stderr}"
+        assert self.PROMPT not in result.output
+        assert self.WARNING not in result.output
+        expected_db = resolve_sqlite_db_path(project_root=project)
+        assert str(expected_db).startswith("/")
+        lines = [l for l in result.output.strip().splitlines() if l.strip()]
+        assert lines[-1] == f"SQLite recording: enabled ({expected_db})"
+
+    def test_noninteractive_no_db_enable_omits_flag_from_entry(self, runner, tmp_path, install_credential):
+        project = tmp_path / "proj"
+        project.mkdir()
+        result = runner.invoke(
+            app,
+            ["install", "claude-code", "--project", str(project), "--no-db-enable"],
+            input=None,
+        )
+        assert result.exit_code == 0, f"stdout={result.output} stderr={result.stderr}"
+        assert self.PROMPT not in result.output
+        assert self.WARNING not in result.output
+        assert "SQLite recording: disabled." in result.output
+        entry = json.loads((project / ".mcp.json").read_text(encoding="utf-8"))["mcpServers"]["jev"]
+        assert "--sqlite-db" not in entry.get("args", [])

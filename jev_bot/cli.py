@@ -16,6 +16,7 @@ from jev_bot.config_store import (
     write_user_config,
 )
 from jev_bot.config import DEFAULT_ENDPOINT, load_config
+from jev_bot.investigation_logging import resolve_sqlite_db_path
 from jev_bot.installer import (
     install as _install,
     install_with_report,
@@ -288,6 +289,12 @@ def install(
         "--force",
         help="Force overwrite of existing skill and replace a foreign JEV MCP registration.",
     ),
+    db_enable: bool | None = typer.Option(
+        None,
+        "--db-enable/--no-db-enable",
+        help="Record successful JEV requests/responses in SQLite. "
+        "Omit to be prompted (interactive) or default to enabled (non-interactive).",
+    ),
 ) -> None:
     """Install the JEV skill and MCP registration into a harness destination."""
     if project_root is None and user_home is None:
@@ -303,9 +310,30 @@ def install(
 
     _ensure_credential_for_install(get_config_path().parent)
 
+    # Audit-first recording preference: an explicit --db-enable/--no-db-enable
+    # always wins; otherwise prompt interactively (Enter = yes) or default to
+    # enabled when no TTY is available.
+    is_interactive = _force_interactive_for_testing or sys.stdin.isatty()
+    if db_enable is None:
+        if is_interactive:
+            typer.echo(
+                "SQLite recording stores request state, questions, and "
+                "shaped responses verbatim."
+            )
+            db_enable = typer.confirm(
+                "Record successful JEV requests and responses in SQLite?",
+                default=True,
+            )
+        else:
+            db_enable = True
+
     try:
         skill_path, mcp_result = install_with_report(
-            harness, project_root=project_root, user_home=user_home, force=force,
+            harness,
+            project_root=project_root,
+            user_home=user_home,
+            force=force,
+            db_enable=db_enable,
         )
     except ValueError as exc:
         typer.echo(f"Error: {exc}", err=True)
@@ -313,6 +341,13 @@ def install(
 
     typer.echo(f"Installed: {skill_path}")
     typer.echo(f"MCP config: {mcp_result.path}")
+    if db_enable:
+        resolved = resolve_sqlite_db_path(
+            project_root=project_root, user_home=user_home
+        )
+        typer.echo(f"SQLite recording: enabled ({resolved})")
+    else:
+        typer.echo("SQLite recording: disabled.")
 
 
 @app.command()

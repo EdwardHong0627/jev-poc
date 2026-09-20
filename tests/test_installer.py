@@ -19,11 +19,14 @@ from jev_bot.installer import (
     install_with_report,
     uninstall_with_report,
 )
+from jev_bot.investigation_logging import resolve_sqlite_db_path
 from jev_bot.mcp_registration import (
     HARNESSES,
+    ManagedVariant,
     RegistrationResult,
     RegistrationStatus,
     canonical_entry,
+    parse_managed_entry,
     registration_target,
 )
 
@@ -74,6 +77,31 @@ def _native_user_path(harness: str, home: Path) -> Path:
     for part in parts:
         cur = cur / part
     return cur / SKILL_NAME
+
+
+@pytest.fixture(autouse=True)
+def _deterministic_xdg(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Delete ``XDG_DATA_HOME`` for every test so user-scope recording
+    resolves against the fake home deterministically (tests that exercise a
+    custom XDG root re-set it explicitly via their own monkeypatch)."""
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+
+
+def _enabled_entry(harness: str, *, project: Path | None = None, home: Path | None = None) -> dict:
+    """Return the expected audit-first MCP entry: the canonical entry enabled
+    at the scope-resolved SQLite path (mirrored through the same resolver the
+    installer uses, so macOS symlinked tmp roots compare equal)."""
+    db_path = resolve_sqlite_db_path(project_root=project, user_home=home)
+    return canonical_entry(harness, db_enable=True, sqlite_db_path=db_path)
+
+
+def _read_entry(config_path: Path, server_path: str) -> object:
+    """Return the ``jev`` server entry stored at *server_path* in JSON file."""
+    data = json.loads(config_path.read_text(encoding="utf-8"))
+    entry: object = data
+    for key in server_path.split("."):
+        entry = entry[key]
+    return entry
 
 
 # ---------------------------------------------------------------------------
@@ -901,7 +929,8 @@ class TestInstallWritesBothSkillAndMCP:
         entry = data
         for k in keys:
             entry = entry[k]
-        assert entry == canonical_entry(harness)
+        # Audit-first default: the entry is enabled at the project-resolved path.
+        assert entry == _enabled_entry(harness, project=project)
 
 
 class TestInstallWritesBothSkillAndMCPUserScope:
@@ -924,7 +953,8 @@ class TestInstallWritesBothSkillAndMCPUserScope:
         entry = data
         for k in keys:
             entry = entry[k]
-        assert entry == canonical_entry(harness)
+        # Audit-first default: user scope resolves the XDG/home fallback path.
+        assert entry == _enabled_entry(harness, home=home)
 
 
 class TestInstallWithReportReturnsResult:
@@ -1008,7 +1038,9 @@ class TestForeignMCPForceInstallWorks:
         entry = data_after
         for k in keys:
             entry = entry[k]
-        assert entry == canonical_entry(harness)
+        # force replaces the foreign entry with the audit-first default:
+        # enabled at the project-resolved SQLite path.
+        assert entry == _enabled_entry(harness, project=project)
 
 
 # ---------------------------------------------------------------------------
@@ -1610,3 +1642,506 @@ class TestUninstallWithReportUserScope:
         scopes = registration_target(harness).user
         assert mcp_result.path == home / scopes.path_key
 
+
+
+# ---------------------------------------------------------------------------
+# 33. Audit-first recording: install propagates db_enable to the MCP entry
+# ---------------------------------------------------------------------------
+
+
+class TestInstallRecordingPropagation:
+    """install/install_with_report default to db_enable=True and pass the
+    flag through to install_server; explicit False preserves the legacy
+    disabled launcher exactly."""
+
+    @pytest.mark.parametrize("harness", HARNESSES)
+    def test_default_install_writes_enabled_entry_at_resolved_path(
+        self, tmp_path: Path, harness: str
+    ) -> None:
+        project = _fixture_dir(tmp_path, f"rec_prop_{harness}")
+        _ensure_installer_dir(project)
+        scopes = registration_target(harness).project
+
+        install(harness, project_root=project)
+
+        entry = _read_entry(project / scopes.path_key, scopes.server_path)
+        db_path = resolve_sqlite_db_path(project_root=project)
+        assert entry == _enabled_entry(harness, project=project)
+        # The written launcher must parse back as an owned ENABLED variant
+        # pointing at exactly the project-resolved database path.
+        managed = parse_managed_entry(harness, entry)
+        assert managed.variant is ManagedVariant.ENABLED
+        assert managed.sqlite_db_path == db_path
+
+    @pytest.mark.parametrize("harness", HARNESSES)
+    def test_explicit_disable_writes_legacy_disabled_entry(
+        self, tmp_path: Path, harness: str
+    ) -> None:
+        project = _fixture_dir(tmp_path, f"rec_off_{harness}")
+        _ensure_installer_dir(project)
+        scopes = registration_target(harness).project
+
+        install(harness, project_root=project, db_enable=False)
+
+        entry = _read_entry(project / scopes.path_key, scopes.server_path)
+        legacy = canonical_entry(harness)
+        assert entry == legacy
+        # Byte-equal serialization — no --sqlite-db residue anywhere.
+        assert json.dumps(entry, sort_keys=True) == json.dumps(legacy, sort_keys=True)
+        assert parse_managed_entry(harness, entry).variant is ManagedVariant.DISABLED
+
+
+# ---------------------------------------------------------------------------
+# 34. Project .gitignore rule handling
+# ---------------------------------------------------------------------------
+
+
+class TestGitignoreHandling:
+    """Enabled project installs maintain the exact ``SQLITE_DB`` ignore rule
+    while preserving existing bytes, newline style, and idempotency."""
+
+    def test_creates_gitignore_when_absent(self, tmp_path: Path) -> None:
+        project = _fixture_dir(tmp_path, "gi_absent")
+        _ensure_installer_dir(project)
+
+        install("claude-code", project_root=project)
+
+        gitignore = project / ".gitignore"
+        assert gitignore.is_file()
+        assert gitignore.read_bytes() == b"SQLITE_DB\n"
+
+    def test_appends_preserving_existing_rule(self, tmp_path: Path) -> None:
+        project = _fixture_dir(tmp_path, "gi_append")
+        _ensure_installer_dir(project)
+        gitignore = project / ".gitignore"
+        gitignore.write_bytes(b"*.pyc\n")
+
+        install("claude-code", project_root=project)
+
+        assert gitignore.read_bytes() == b"*.pyc\nSQLITE_DB\n"
+
+    def test_appends_when_no_trailing_newline(self, tmp_path: Path) -> None:
+        """A file whose last line lacks a newline gains exactly one; the
+        pre-existing bytes are untouched."""
+        project = _fixture_dir(tmp_path, "gi_no_eol")
+        _ensure_installer_dir(project)
+        gitignore = project / ".gitignore"
+        gitignore.write_bytes(b"foo")
+
+        install("claude-code", project_root=project)
+
+        assert gitignore.read_bytes() == b"foo\nSQLITE_DB\n"
+
+    def test_appends_to_crlf_file_preserving_style(self, tmp_path: Path) -> None:
+        """Existing CRLF bytes are preserved verbatim."""
+        project = _fixture_dir(tmp_path, "gi_crlf")
+        _ensure_installer_dir(project)
+        gitignore = project / ".gitignore"
+        gitignore.write_bytes(b"foo\r\nbar\r\n")
+
+        install("claude-code", project_root=project)
+
+        assert gitignore.read_bytes() == b"foo\r\nbar\r\nSQLITE_DB\n"
+
+    def test_idempotent_when_rule_already_present(self, tmp_path: Path) -> None:
+        project = _fixture_dir(tmp_path, "gi_idempotent")
+        _ensure_installer_dir(project)
+        gitignore = project / ".gitignore"
+        original = b"*.pyc\nSQLITE_DB\n"
+        gitignore.write_bytes(original)
+
+        install("claude-code", project_root=project)
+
+        assert gitignore.read_bytes() == original
+
+        # Second install: still byte-identical, no duplicate rule.
+        install("claude-code", project_root=project)
+
+        assert gitignore.read_bytes() == original
+
+    def test_commented_rule_is_not_an_active_rule(self, tmp_path: Path) -> None:
+        """``#SQLITE_DB`` is a comment, not a rule — the rule is appended once."""
+        project = _fixture_dir(tmp_path, "gi_commented")
+        _ensure_installer_dir(project)
+        gitignore = project / ".gitignore"
+        gitignore.write_bytes(b"#SQLITE_DB\n")
+
+        install("claude-code", project_root=project)
+
+        assert gitignore.read_bytes() == b"#SQLITE_DB\nSQLITE_DB\n"
+
+        # Second install keeps it single.
+        install("claude-code", project_root=project)
+
+        assert gitignore.read_bytes() == b"#SQLITE_DB\nSQLITE_DB\n"
+
+    def test_symlinked_gitignore_rejects_before_any_mutation(
+        self, tmp_path: Path
+    ) -> None:
+        project = _fixture_dir(tmp_path, "gi_symlink")
+        _ensure_installer_dir(project)
+        real = tmp_path / "real_gitignore"
+        real.write_bytes(b"keep\n")
+        (project / ".gitignore").symlink_to(real)
+
+        with pytest.raises(RuntimeError, match="symlink"):
+            install("claude-code", project_root=project)
+
+        # Nothing else was mutated — the recording preflight aborts the
+        # install before skill write or MCP registration.
+        assert not _native_project_path("claude-code", project).exists()
+        assert not (project / ".mcp.json").exists()
+        assert real.read_bytes() == b"keep\n"
+
+    def test_directory_gitignore_rejected(self, tmp_path: Path) -> None:
+        project = _fixture_dir(tmp_path, "gi_directory")
+        _ensure_installer_dir(project)
+        (project / ".gitignore").mkdir()
+
+        with pytest.raises(RuntimeError, match="directory"):
+            install("claude-code", project_root=project)
+
+        assert not _native_project_path("claude-code", project).exists()
+        assert not (project / ".mcp.json").exists()
+
+    def test_disabled_never_touches_gitignore(self, tmp_path: Path) -> None:
+        project = _fixture_dir(tmp_path, "gi_disabled")
+        _ensure_installer_dir(project)
+
+        # Absent stays absent.
+        install("claude-code", project_root=project, db_enable=False)
+        assert not (project / ".gitignore").exists()
+
+        # Pre-existing bytes stay untouched.
+        gitignore = project / ".gitignore"
+        gitignore.write_bytes(b"foo\n")
+        install("claude-code", project_root=project, db_enable=False)
+        assert gitignore.read_bytes() == b"foo\n"
+
+
+# ---------------------------------------------------------------------------
+# 35. User-scope private data directory preparation
+# ---------------------------------------------------------------------------
+
+
+class TestUserDataDirPreparation:
+    """Enabled user-scope installs create/maintain the 0700 XDG data
+    directory; unsafe ancestors abort before any mutation."""
+
+    def test_creates_private_dir_even_under_permissive_umask(
+        self, tmp_path: Path
+    ) -> None:
+        home = _host_home(tmp_path)
+        _ensure_installer_dir(tmp_path / "installer")
+        data_dir = home / ".local" / "share" / "jev-poc"
+
+        old_umask = os.umask(0o000)
+        try:
+            install("claude-code", user_home=home)
+        finally:
+            os.umask(old_umask)
+
+        assert data_dir.is_dir()
+        assert data_dir.stat().st_mode & 0o777 == 0o700
+
+    def test_narrows_pre_existing_world_readable_dir(self, tmp_path: Path) -> None:
+        home = _host_home(tmp_path)
+        _ensure_installer_dir(tmp_path / "installer")
+        data_dir = home / ".local" / "share" / "jev-poc"
+        data_dir.mkdir(parents=True)
+        os.chmod(data_dir, 0o755)
+
+        install("claude-code", user_home=home)
+
+        assert data_dir.stat().st_mode & 0o777 == 0o700
+
+    def test_file_ancestor_rejects_before_mutation(self, tmp_path: Path) -> None:
+        """``~/.local/share`` existing as a regular file aborts with
+        ValueError and zero mutation (skill/config untouched)."""
+        home = _host_home(tmp_path)
+        _ensure_installer_dir(tmp_path / "installer")
+        (home / ".local").mkdir()
+        (home / ".local" / "share").write_text("not a directory", encoding="utf-8")
+
+        with pytest.raises(ValueError, match="regular file"):
+            install("claude-code", user_home=home)
+
+        assert not _native_user_path("claude-code", home).exists()
+        assert not (home / ".claude.json").exists()
+
+    def test_data_dir_existing_as_file_rejects_before_mutation(
+        self, tmp_path: Path
+    ) -> None:
+        home = _host_home(tmp_path)
+        _ensure_installer_dir(tmp_path / "installer")
+        data_dir = home / ".local" / "share" / "jev-poc"
+        data_dir.mkdir(parents=True)
+        data_dir.rmdir()
+        data_dir.write_text("not a directory", encoding="utf-8")
+
+        with pytest.raises(ValueError, match="not a directory"):
+            install("claude-code", user_home=home)
+
+        assert not _native_user_path("claude-code", home).exists()
+        assert not (home / ".claude.json").exists()
+
+    def test_symlinked_share_ancestor_rejects(self, tmp_path: Path) -> None:
+        home = _host_home(tmp_path)
+        _ensure_installer_dir(tmp_path / "installer")
+        real_share = tmp_path / "real_share"
+        real_share.mkdir()
+        (home / ".local").mkdir()
+        (home / ".local" / "share").symlink_to(real_share)
+
+        with pytest.raises(RuntimeError, match="symlink"):
+            install("claude-code", user_home=home)
+
+        assert not any(real_share.iterdir()), "nothing may be created through the symlink"
+        assert not _native_user_path("claude-code", home).exists()
+        assert not (home / ".claude.json").exists()
+
+    def test_symlinked_data_dir_rejects(self, tmp_path: Path) -> None:
+        home = _host_home(tmp_path)
+        _ensure_installer_dir(tmp_path / "installer")
+        real_dir = tmp_path / "real_data"
+        real_dir.mkdir()
+        share = home / ".local" / "share"
+        share.mkdir(parents=True)
+        (share / "jev-poc").symlink_to(real_dir)
+
+        with pytest.raises(RuntimeError, match="symlink"):
+            install("claude-code", user_home=home)
+
+        assert not any(real_dir.iterdir()), "nothing may be created through the symlink"
+        assert not _native_user_path("claude-code", home).exists()
+        assert not (home / ".claude.json").exists()
+
+    def test_custom_absolute_xdg_is_honored(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        home = _host_home(tmp_path)
+        _ensure_installer_dir(tmp_path / "installer")
+        xdg = tmp_path / "xdg_data"
+        monkeypatch.setenv("XDG_DATA_HOME", str(xdg))
+
+        install("claude-code", user_home=home)
+
+        db_path = resolve_sqlite_db_path(
+            user_home=home, environ={"XDG_DATA_HOME": str(xdg)}
+        )
+        assert db_path == xdg.resolve() / "jev-poc" / "SQLITE_DB"
+        entry = _read_entry(home / ".claude.json", "mcpServers.jev")
+        assert entry == canonical_entry(
+            "claude-code", db_enable=True, sqlite_db_path=db_path
+        )
+        data_dir = xdg / "jev-poc"
+        assert data_dir.is_dir()
+        assert data_dir.stat().st_mode & 0o777 == 0o700
+        # The home fallback must not be touched when XDG wins.
+        assert not (home / ".local").exists()
+
+    def test_relative_xdg_raises_and_creates_nothing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        home = _host_home(tmp_path)
+        _ensure_installer_dir(tmp_path / "installer")
+        monkeypatch.setenv("XDG_DATA_HOME", "relative/data")
+
+        with pytest.raises(ValueError, match="(?i)absolute"):
+            install("claude-code", user_home=home)
+
+        # The resolver rejects before the installer mutates anything: the
+        # fake home contains neither skill directory nor MCP config.
+        assert sorted(p.name for p in home.iterdir()) == []
+        assert not (tmp_path / "relative").exists()
+        assert not (tmp_path / "installer" / "relative").exists()
+
+
+# ---------------------------------------------------------------------------
+# 36. Symlinked recording targets are rejected pre-mutation
+# ---------------------------------------------------------------------------
+
+
+class TestRecordingSymlinkRejection:
+    def test_project_sqlite_db_symlink_rejects(self, tmp_path: Path) -> None:
+        project = _fixture_dir(tmp_path, "db_symlink")
+        _ensure_installer_dir(project)
+        real_db = tmp_path / "real_db"
+        real_db.write_bytes(b"sqlite")
+        (project / "SQLITE_DB").symlink_to(real_db)
+
+        with pytest.raises(RuntimeError, match="symlink"):
+            install("claude-code", project_root=project)
+
+        # Zero mutation: no skill, no config, no .gitignore.
+        assert not _native_project_path("claude-code", project).exists()
+        assert not (project / ".mcp.json").exists()
+        assert not (project / ".gitignore").exists()
+        assert real_db.read_bytes() == b"sqlite"
+
+    def test_user_data_dir_symlink_rejects(self, tmp_path: Path) -> None:
+        home = _host_home(tmp_path)
+        _ensure_installer_dir(tmp_path / "installer")
+        real_dir = tmp_path / "real_home_data"
+        real_dir.mkdir()
+        share = home / ".local" / "share"
+        share.mkdir(parents=True)
+        (share / "jev-poc").symlink_to(real_dir)
+
+        with pytest.raises(RuntimeError, match="symlink"):
+            install("claude-code", user_home=home)
+
+        assert not _native_user_path("claude-code", home).exists()
+        assert not (home / ".claude.json").exists()
+        assert not any(real_dir.iterdir())
+
+
+# ---------------------------------------------------------------------------
+# 37. Disabling recording on an enabled install preserves history
+# ---------------------------------------------------------------------------
+
+
+class TestDisabledPreservesHistory:
+    """Reinstalling with db_enable=False migrates the entry back to the
+    legacy disabled shape without deleting any recording artifact."""
+
+    def test_project_reinstall_disabled_keeps_gitignore_rule(
+        self, tmp_path: Path
+    ) -> None:
+        project = _fixture_dir(tmp_path, "disable_keep_gi")
+        _ensure_installer_dir(project)
+
+        _, first = install_with_report("claude-code", project_root=project)
+        assert first.status is RegistrationStatus.CREATED
+        gitignore = project / ".gitignore"
+        gi_bytes = gitignore.read_bytes()
+        assert gi_bytes == b"SQLITE_DB\n"
+
+        _, second = install_with_report(
+            "claude-code", project_root=project, db_enable=False
+        )
+
+        # Managed entry migrated without force.
+        assert second.status is RegistrationStatus.REPLACED
+        entry = _read_entry(project / ".mcp.json", "mcpServers.jev")
+        legacy = canonical_entry("claude-code")
+        assert entry == legacy
+        assert json.dumps(entry, sort_keys=True) == json.dumps(legacy, sort_keys=True)
+        # Recording artifacts survive: rule preserved byte-for-byte, and the
+        # database itself was never created (nor anything deleted).
+        assert gitignore.read_bytes() == gi_bytes
+        assert not (project / "SQLITE_DB").exists()
+
+    def test_user_reinstall_disabled_keeps_data_dir(self, tmp_path: Path) -> None:
+        home = _host_home(tmp_path)
+        _ensure_installer_dir(tmp_path / "installer")
+
+        install("claude-code", user_home=home)
+        data_dir = home / ".local" / "share" / "jev-poc"
+        assert data_dir.is_dir()
+
+        _, second = install_with_report("claude-code", user_home=home, db_enable=False)
+
+        assert second.status is RegistrationStatus.REPLACED
+        assert data_dir.is_dir()
+        assert data_dir.stat().st_mode & 0o777 == 0o700
+        entry = _read_entry(home / ".claude.json", "mcpServers.jev")
+        assert entry == canonical_entry("claude-code")
+
+    def test_disabled_then_enabled_migrates_forward_without_force(
+        self, tmp_path: Path
+    ) -> None:
+        """The reverse direction (legacy install gaining recording) is also a
+        no-force managed migration."""
+        project = _fixture_dir(tmp_path, "legacy_to_enabled")
+        _ensure_installer_dir(project)
+
+        install("claude-code", project_root=project, db_enable=False)
+        assert (
+            _read_entry(project / ".mcp.json", "mcpServers.jev")
+            == canonical_entry("claude-code")
+        )
+
+        _, result = install_with_report("claude-code", project_root=project)
+
+        assert result.status is RegistrationStatus.REPLACED
+        assert (
+            _read_entry(project / ".mcp.json", "mcpServers.jev")
+            == _enabled_entry("claude-code", project=project)
+        )
+
+
+# ---------------------------------------------------------------------------
+# 38. Ordering/atomicity of the recording steps
+# ---------------------------------------------------------------------------
+
+
+class TestOrderingAndAtomicity:
+    def test_enabled_install_never_creates_database_file(
+        self, tmp_path: Path
+    ) -> None:
+        """The installer prepares dir/gitignore/config/skill — the SQLite
+        database file itself is created lazily by jev-mcp, never here."""
+        project = _fixture_dir(tmp_path, "no_db_file")
+        _ensure_installer_dir(project)
+
+        install("claude-code", project_root=project)
+
+        db_path = resolve_sqlite_db_path(project_root=project)
+        assert not db_path.exists()
+        # All the surrounding artifacts DO exist.
+        assert (project / ".gitignore").is_file()
+        assert (project / ".mcp.json").is_file()
+        assert (_native_project_path("claude-code", project) / "SKILL.md").is_file()
+
+    @pytest.mark.parametrize("harness", HARNESSES)
+    def test_foreign_mcp_entry_aborts_with_zero_recording_artifacts(
+        self, tmp_path: Path, harness: str
+    ) -> None:
+        """Recording preflight runs (and passes) but must not apply: the
+        install aborts at the MCP preflight, so no .gitignore/skill bytes
+        may ever reach the filesystem."""
+        project = _fixture_dir(tmp_path, f"foreign_recording_{harness}")
+        _ensure_installer_dir(project)
+        scopes = registration_target(harness).project
+        config_path = project / scopes.path_key
+        # Build the harness's *full* dotted server path (opencode nests under
+        # mcp.servers.jev, not a single top-level key).
+        keys = scopes.server_path.split(".")
+        data: dict = {}
+        cur = data
+        for k in keys[:-1]:
+            cur = cur.setdefault(k, {})
+        cur[keys[-1]] = {"type": "websocket", "url": "https://f.example"}
+        foreign = json.dumps(data, indent=2)
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(foreign, encoding="utf-8")
+
+        with pytest.raises(ValueError, match="Refusing to install"):
+            install(harness, project_root=project)
+
+        assert not _native_project_path(harness, project).exists()
+        assert not (project / ".gitignore").exists()
+        assert config_path.read_text(encoding="utf-8") == foreign
+
+
+# ---------------------------------------------------------------------------
+# 39. Disabled user installs create no recording artifacts at all
+# ---------------------------------------------------------------------------
+
+
+class TestDisabledCreatesNoArtifacts:
+    def test_user_disabled_creates_no_data_dir_or_gitignore(self, tmp_path: Path) -> None:
+        home = _host_home(tmp_path)
+        _ensure_installer_dir(tmp_path / "installer")
+
+        install("claude-code", user_home=home, db_enable=False)
+
+        assert not (home / ".local").exists()
+        assert not (home / ".gitignore").exists()
+        # The install itself still happened (skill + disabled entry).
+        assert (_native_user_path("claude-code", home) / "SKILL.md").is_file()
+        assert (
+            _read_entry(home / ".claude.json", "mcpServers.jev")
+            == canonical_entry("claude-code")
+        )

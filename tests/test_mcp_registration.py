@@ -2,16 +2,25 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
+from pathlib import Path
+
 import pytest
 
 from jev_bot.mcp_registration import (
     HARNESSES,
     JEV_GIT_URL,
     REGISTRY,
+    SQLITE_DB_FLAG,
+    ManagedVariant,
     ScopeSpec,
     Scopes,
+    ServerEntryState,
     canonical_entry,
+    classify_server_entry,
+    parse_managed_entry,
     registration_target,
+    write_config_atomic,
 )
 
 
@@ -278,6 +287,329 @@ class TestCanonicalEntryDefensiveCopy:
         entry1 = canonical_entry("pi")
         entry2 = canonical_entry("pi")
         assert entry1 is not entry2
+
+
+# ── SQLite opt-in: canonical entry suffix ───────────────────────────
+
+# The pre-change hardcoded entry shapes.  The disabled default of
+# canonical_entry() must remain byte-for-byte these entries.
+_HISTORICAL_ENTRY: dict[str, dict] = {
+    "claude-code": {
+        "type": "stdio",
+        "command": "uvx",
+        "args": ["--from", JEV_GIT_URL, "jev-mcp"],
+    },
+    "opencode": {
+        "type": "local",
+        "command": ["uvx", "--from", JEV_GIT_URL, "jev-mcp"],
+    },
+    "oh-my-pi": {
+        "type": "stdio",
+        "command": "uvx",
+        "args": ["--from", JEV_GIT_URL, "jev-mcp"],
+    },
+    "pi": {
+        "transport": "stdio",
+        "command": "uvx",
+        "args": ["--from", JEV_GIT_URL, "jev-mcp"],
+        "lifecycle": "lazy",
+    },
+}
+
+# Which field carries the launcher token list for each harness.
+_LAUNCHER_KEYS: dict[str, str] = {
+    "claude-code": "args",
+    "opencode": "command",
+    "oh-my-pi": "args",
+    "pi": "args",
+}
+
+_SQLITE_DB_PATH = Path("/abs/SQLITE_DB")
+_SQLITE_SUFFIX = [SQLITE_DB_FLAG, "/abs/SQLITE_DB"]
+
+
+def _flat_values(entry: dict) -> list[str]:
+    """Every scalar string reachable inside an entry dict."""
+    tokens: list[str] = []
+    for value in entry.values():
+        if isinstance(value, list):
+            tokens.extend(str(item) for item in value)
+        elif isinstance(value, str):
+            tokens.append(value)
+    return tokens
+
+
+class TestCanonicalEntrySqliteSuffix:
+    """The disabled default is the historical entry; the enabled entry is that
+    entry plus exactly ``["--sqlite-db", ABS_PATH]`` on the launcher list."""
+
+    @pytest.mark.parametrize("harness", HARNESSES)
+    def test_disabled_default_equals_historical_entry(self, harness: str) -> None:
+        expected = deepcopy(_HISTORICAL_ENTRY[harness])
+        entry = canonical_entry(harness)
+        assert entry == expected
+        assert set(entry) == set(expected)
+
+    @pytest.mark.parametrize("harness", HARNESSES)
+    def test_disabled_default_carries_no_sqlite_token(self, harness: str) -> None:
+        entry = canonical_entry(harness)
+        assert SQLITE_DB_FLAG not in _flat_values(entry)
+        assert not any(SQLITE_DB_FLAG in tok for tok in _flat_values(entry))
+
+    @pytest.mark.parametrize("harness", HARNESSES)
+    def test_explicit_disabled_equals_default(self, harness: str) -> None:
+        default = canonical_entry(harness)
+        explicit = canonical_entry(
+            harness, db_enable=False, sqlite_db_path=None
+        )
+        assert explicit == default
+        assert explicit == deepcopy(_HISTORICAL_ENTRY[harness])
+
+    @pytest.mark.parametrize("harness", HARNESSES)
+    def test_enabled_is_disabled_plus_suffix(self, harness: str) -> None:
+        disabled = canonical_entry(harness)
+        enabled = canonical_entry(
+            harness, db_enable=True, sqlite_db_path=_SQLITE_DB_PATH
+        )
+        launcher_key = _LAUNCHER_KEYS[harness]
+        stripped = deepcopy(enabled)
+        stripped[launcher_key] = enabled[launcher_key][:-2]
+        assert stripped == disabled
+
+    @pytest.mark.parametrize("harness", HARNESSES)
+    def test_suffix_appended_to_launcher_field(self, harness: str) -> None:
+        launcher_key = _LAUNCHER_KEYS[harness]
+        base = canonical_entry(harness)
+        enabled = canonical_entry(
+            harness, db_enable=True, sqlite_db_path=_SQLITE_DB_PATH
+        )
+        base_launcher = base[launcher_key]
+        assert isinstance(base_launcher, list)
+        if harness == "opencode":
+            assert launcher_key == "command"
+        else:
+            assert launcher_key == "args"
+        # The base launcher is preserved as a prefix of the enabled launcher.
+        enabled_launcher = enabled[launcher_key]
+        assert enabled_launcher[: len(base_launcher)] == base_launcher
+        # The suffix is exactly the SQLite pair, appended to the launcher only.
+        assert enabled_launcher[len(base_launcher):] == _SQLITE_SUFFIX
+        for other_key, value in enabled.items():
+            if other_key != launcher_key:
+                assert value == base[other_key]
+
+    @pytest.mark.parametrize("harness", HARNESSES)
+    def test_enabled_mutation_does_not_poison_later_lookups(self, harness: str) -> None:
+        launcher_key = _LAUNCHER_KEYS[harness]
+        enabled = canonical_entry(
+            harness, db_enable=True, sqlite_db_path=_SQLITE_DB_PATH
+        )
+        enabled["type"] = "spoofed"
+        enabled["transport"] = "spoofed"
+        enabled[launcher_key].append("corrupted")
+
+        # A fresh disabled lookup is clean: the historical shape, no suffix.
+        fresh_disabled = canonical_entry(harness)
+        assert fresh_disabled == deepcopy(_HISTORICAL_ENTRY[harness])
+        assert SQLITE_DB_FLAG not in _flat_values(fresh_disabled)
+        assert "corrupted" not in fresh_disabled[launcher_key]
+
+        # A fresh enabled lookup is untouched by the mutation above.
+        fresh_enabled = canonical_entry(
+            harness, db_enable=True, sqlite_db_path=_SQLITE_DB_PATH
+        )
+        assert "corrupted" not in fresh_enabled[launcher_key]
+        assert fresh_enabled[launcher_key][-2:] == _SQLITE_SUFFIX
+
+
+class TestCanonicalEntryEnableValidation:
+    """Enabling requires an absolute Path; a path without enabling is a bug."""
+
+    def test_enable_without_path_raises(self) -> None:
+        with pytest.raises(ValueError, match="sqlite_db_path"):
+            canonical_entry("claude-code", db_enable=True)
+
+    def test_enable_with_relative_path_raises(self) -> None:
+        with pytest.raises(ValueError, match="absolute"):
+            canonical_entry(
+                "claude-code", db_enable=True, sqlite_db_path=Path("rel/SQLITE_DB")
+            )
+
+    def test_path_without_enable_raises(self) -> None:
+        with pytest.raises(ValueError, match="requires db_enable=True"):
+            canonical_entry(
+                "claude-code", db_enable=False, sqlite_db_path=_SQLITE_DB_PATH
+            )
+
+    def test_path_without_enable_raises_by_default(self) -> None:
+        with pytest.raises(ValueError, match="requires db_enable=True"):
+            canonical_entry("opencode", sqlite_db_path=_SQLITE_DB_PATH)
+
+    @pytest.mark.parametrize("harness", ["unknown", ""])
+    def test_unknown_harness_still_raises_when_enabling(self, harness: str) -> None:
+        with pytest.raises(ValueError, match="not a recognized MCP harness"):
+            canonical_entry(
+                harness, db_enable=True, sqlite_db_path=_SQLITE_DB_PATH
+            )
+
+
+# ── Managed-entry parsing ───────────────────────────────────────────
+
+
+def _with_launcher(harness: str, launcher: list) -> dict:
+    """The historical base entry with its launcher list replaced."""
+    entry = deepcopy(_HISTORICAL_ENTRY[harness])
+    entry[_LAUNCHER_KEYS[harness]] = launcher
+    return entry
+
+
+class TestParseManagedEntry:
+    """parse_managed_entry owns exactly the base and base+SQLite-pair shapes."""
+
+    @pytest.mark.parametrize("harness", HARNESSES)
+    def test_exact_disabled_is_managed(self, harness: str) -> None:
+        parsed = parse_managed_entry(harness, canonical_entry(harness))
+        assert parsed.variant is ManagedVariant.DISABLED
+        assert parsed.sqlite_db_path is None
+
+    @pytest.mark.parametrize("harness", HARNESSES)
+    def test_exact_enabled_is_managed_with_path(self, harness: str) -> None:
+        entry = canonical_entry(
+            harness, db_enable=True, sqlite_db_path=_SQLITE_DB_PATH
+        )
+        parsed = parse_managed_entry(harness, entry)
+        assert parsed.variant is ManagedVariant.ENABLED
+        assert parsed.sqlite_db_path == _SQLITE_DB_PATH
+
+    @pytest.mark.parametrize("harness", HARNESSES)
+    def test_extra_token_is_foreign(self, harness: str) -> None:
+        base = canonical_entry(harness)[_LAUNCHER_KEYS[harness]]
+        entry = _with_launcher(harness, [*base, "--verbose"])
+        assert parse_managed_entry(harness, entry).variant is ManagedVariant.FOREIGN
+
+    @pytest.mark.parametrize("harness", HARNESSES)
+    def test_extra_token_after_sqlite_pair_is_foreign(self, harness: str) -> None:
+        base = canonical_entry(harness)[_LAUNCHER_KEYS[harness]]
+        entry = _with_launcher(harness, [*base, *_SQLITE_SUFFIX, "--verbose"])
+        assert parse_managed_entry(harness, entry).variant is ManagedVariant.FOREIGN
+
+    @pytest.mark.parametrize("harness", HARNESSES)
+    def test_sqlite_pair_reordered_into_launcher_is_foreign(
+        self, harness: str
+    ) -> None:
+        """The flag inserted mid-launcher is not the owned trailing suffix."""
+        base = canonical_entry(harness)[_LAUNCHER_KEYS[harness]]
+        inserted = [*base[:-1], *[_SQLITE_SUFFIX[0], _SQLITE_SUFFIX[1]], base[-1]]
+        entry = _with_launcher(harness, inserted)
+        assert parse_managed_entry(harness, entry).variant is ManagedVariant.FOREIGN
+
+    @pytest.mark.parametrize("harness", HARNESSES)
+    def test_relative_sqlite_path_is_foreign(self, harness: str) -> None:
+        base = canonical_entry(harness)[_LAUNCHER_KEYS[harness]]
+        entry = _with_launcher(harness, [*base, SQLITE_DB_FLAG, "rel/SQLITE_DB"])
+        assert parse_managed_entry(harness, entry).variant is ManagedVariant.FOREIGN
+
+    @pytest.mark.parametrize("harness", HARNESSES)
+    def test_flag_without_path_is_foreign(self, harness: str) -> None:
+        base = canonical_entry(harness)[_LAUNCHER_KEYS[harness]]
+        entry = _with_launcher(harness, [*base, SQLITE_DB_FLAG])
+        assert parse_managed_entry(harness, entry).variant is ManagedVariant.FOREIGN
+
+    @pytest.mark.parametrize("harness", HARNESSES)
+    def test_path_without_flag_is_foreign(self, harness: str) -> None:
+        base = canonical_entry(harness)[_LAUNCHER_KEYS[harness]]
+        entry = _with_launcher(harness, [*base, "/abs/SQLITE_DB"])
+        assert parse_managed_entry(harness, entry).variant is ManagedVariant.FOREIGN
+
+    @pytest.mark.parametrize("harness", HARNESSES)
+    def test_extra_unknown_key_is_foreign(self, harness: str) -> None:
+        entry = canonical_entry(harness)
+        entry["env"] = {"TOKEN": "x"}
+        assert parse_managed_entry(harness, entry).variant is ManagedVariant.FOREIGN
+
+    @pytest.mark.parametrize("harness", HARNESSES)
+    def test_different_transport_field_is_foreign(self, harness: str) -> None:
+        entry = canonical_entry(harness)
+        transport_key = "transport" if harness == "pi" else "type"
+        entry[transport_key] = "sse"
+        assert parse_managed_entry(harness, entry).variant is ManagedVariant.FOREIGN
+
+    @pytest.mark.parametrize("harness", HARNESSES)
+    def test_non_dict_value_is_foreign(self, harness: str) -> None:
+        base = canonical_entry(harness)
+        assert (
+            parse_managed_entry(harness, base[_LAUNCHER_KEYS[harness]]).variant
+            is ManagedVariant.FOREIGN
+        )
+        assert parse_managed_entry(harness, "uvx").variant is ManagedVariant.FOREIGN
+        assert parse_managed_entry(harness, None).variant is ManagedVariant.FOREIGN
+
+    def test_unknown_harness_is_foreign_without_raising(self) -> None:
+        for entry in (canonical_entry("claude-code"), canonical_entry("opencode")):
+            parsed = parse_managed_entry("bogus-harness", entry)
+            assert parsed.variant is ManagedVariant.FOREIGN
+            assert parsed.sqlite_db_path is None
+
+
+# ── classify_server_entry on managed variants ───────────────────────
+
+
+def _seed_server_entry(project: Path, harness: str, entry: dict) -> Path:
+    """Write *entry* at the harness's jev server path; return config path."""
+    scopes = registration_target(harness).project
+    config_path = project / scopes.path_key
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    keys = scopes.server_path.split(".")
+    data: dict = {}
+    cursor = data
+    for key in keys[:-1]:
+        cursor = cursor.setdefault(key, {})
+    cursor[keys[-1]] = entry
+    write_config_atomic(config_path, data, stop_root=project)
+    return config_path
+
+
+class TestClassifyServerEntryManagedVariants:
+    """JEV owns both managed variants; anything else stays foreign."""
+
+    @pytest.mark.parametrize("harness", HARNESSES)
+    def test_seeded_disabled_entry_is_canonical(self, tmp_path: Path, harness: str) -> None:
+        project = tmp_path / "proj"
+        project.mkdir()
+        config_path = _seed_server_entry(project, harness, canonical_entry(harness))
+        assert (
+            classify_server_entry(harness, config_path, stop_root=project)
+            == ServerEntryState.CANONICAL
+        )
+
+    @pytest.mark.parametrize("harness", HARNESSES)
+    def test_seeded_enabled_entry_is_canonical(self, tmp_path: Path, harness: str) -> None:
+        project = tmp_path / "proj"
+        project.mkdir()
+        enabled = canonical_entry(
+            harness, db_enable=True, sqlite_db_path=_SQLITE_DB_PATH
+        )
+        config_path = _seed_server_entry(project, harness, enabled)
+        assert (
+            classify_server_entry(harness, config_path, stop_root=project)
+            == ServerEntryState.CANONICAL
+        )
+
+    @pytest.mark.parametrize("harness", HARNESSES)
+    def test_enabled_with_extra_arg_is_foreign(self, tmp_path: Path, harness: str) -> None:
+        project = tmp_path / "proj"
+        project.mkdir()
+        launcher_key = _LAUNCHER_KEYS[harness]
+        enabled = canonical_entry(
+            harness, db_enable=True, sqlite_db_path=_SQLITE_DB_PATH
+        )
+        entry = canonical_entry(harness)
+        entry[launcher_key] = [*enabled[launcher_key], "--verbose"]
+        config_path = _seed_server_entry(project, harness, entry)
+        assert (
+            classify_server_entry(harness, config_path, stop_root=project)
+            == ServerEntryState.FOREIGN
+        )
 
 
 # ── Specific path-key assertions ────────────────────────────────────
