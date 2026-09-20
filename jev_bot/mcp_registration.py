@@ -3,7 +3,13 @@
 Defines the declarative mapping of harness identifiers to their
 project/user configuration paths and the transport-agnostic JSON
 structures used to launch the JEV MCP server.  Zero side-effects,
-no Typer dependency, no filesystem or config-store coupling.
+no Typer dependency, no filesystem or config-store coupling — except
+that ``install_server``/``uninstall_server`` read and atomically write
+the harness config file at an explicitly provided scope root.
+
+Canonical entries come in two JEV-owned managed variants: the base
+launcher, and the base launcher extended with ``--sqlite-db
+ABSOLUTE_PATH`` to record successful investigations.
 """
 
 from __future__ import annotations
@@ -12,12 +18,17 @@ import json
 import os
 import tempfile
 from dataclasses import dataclass, field
-from enum import Enum, auto
+from enum import Enum, auto, unique
 from pathlib import Path
 
 from copy import deepcopy
 
+from jev_bot.investigation_logging import resolve_sqlite_db_path
+
 JEV_GIT_URL = "git+https://github.com/EdwardHong0627/jev-poc.git"
+
+# Flag the jev-mcp server accepts to enable SQLite investigation recording.
+SQLITE_DB_FLAG = "--sqlite-db"
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,17 +139,167 @@ def registration_target(harness: str) -> Scopes:
     return REGISTRY[harness].scopes
 
 
-def canonical_entry(harness: str) -> dict:
+def _launcher_list(entry: dict) -> list[str]:
+    """Return the mutable launcher argument list of a *copy* of an entry.
+
+    Claude Code / Oh My Pi / Pi keep arguments in ``args``; OpenCode uses an
+    array-form ``command``.  Raises ``ValueError`` when neither is a list.
+    """
+    for key in ("args", "command"):
+        value = entry.get(key)
+        if isinstance(value, list):
+            return value
+    raise ValueError(f"Canonical entry has no list-form launcher field: {entry!r}")
+
+
+def canonical_entry(
+    harness: str,
+    *,
+    db_enable: bool = False,
+    sqlite_db_path: Path | None = None,
+) -> dict:
     """Return a copy of the transport-specific JSON entry dict for *harness*.
 
-    Raises ``ValueError`` when *harness* is not recognized.
+    Two JEV-owned shapes exist:
+
+    - **disabled** (default) — the bare portable launcher, byte-for-byte the
+      historical canonical entry;
+    - **enabled** — the same entry with ``--sqlite-db ABSOLUTE_PATH`` appended
+      to the launcher list (``args`` for Claude Code / Oh My Pi / Pi, the
+      array-form ``command`` for OpenCode), so ``jev-mcp`` records successful
+      investigations into that SQLite database.
+
+    ``sqlite_db_path`` is required when *db_enable* is true and must be an
+    already-absolute path.  This function is a pure transformation: it never
+    reads environment variables, touches the filesystem, or resolves relative
+    paths.
+
+    Raises ``ValueError`` when *harness* is not recognized, when enabling
+    without an absolute *sqlite_db_path*, or when a path is supplied while
+    recording is disabled.
     """
+    entry = _raw_canonical_entry(harness)
+
+    if not db_enable:
+        if sqlite_db_path is not None:
+            raise ValueError(
+                "sqlite_db_path requires db_enable=True; the disabled "
+                "canonical entry must omit SQLite arguments"
+            )
+        return entry
+
+    if sqlite_db_path is None:
+        raise ValueError(
+            "canonical_entry(db_enable=True) requires an absolute sqlite_db_path"
+        )
+    if not isinstance(sqlite_db_path, Path):
+        raise ValueError(
+            f"sqlite_db_path must be a pathlib.Path, got {type(sqlite_db_path).__name__}"
+        )
+    if not sqlite_db_path.is_absolute():
+        raise ValueError(
+            f"sqlite_db_path must be absolute, got relative path {str(sqlite_db_path)!r}"
+        )
+
+    _launcher_list(entry).extend([SQLITE_DB_FLAG, str(sqlite_db_path)])
+    return entry
+
+
+def _raw_canonical_entry(harness: str) -> dict:
+    """Return a deep copy of the disabled base entry for *harness*."""
     if harness not in _CANONICAL_ENTRIES:
         raise ValueError(
             f"'{harness}' is not a recognized MCP harness "
             f"(expected one of {list(_CANONICAL_ENTRIES)})"
         )
     return deepcopy(_CANONICAL_ENTRIES[harness])
+
+
+# ── Managed-entry parsing ───────────────────────────────────────────
+
+
+@unique
+class ManagedVariant(Enum):
+    """Provenance of a ``jev`` server entry relative to JEV's own writers."""
+
+    FOREIGN = auto()
+    DISABLED = auto()
+    ENABLED = auto()
+
+
+@dataclass(frozen=True, slots=True)
+class ManagedEntry:
+    """Classification of a ``jev`` entry as JEV-owned or foreign.
+
+    ``variant`` is ``FOREIGN`` for anything JEV does not own, ``DISABLED`` for
+    the exact bare launcher, and ``ENABLED`` for the exact bare launcher
+    followed only by ``--sqlite-db`` and one absolute path (recorded in
+    ``sqlite_db_path``).
+    """
+
+    variant: ManagedVariant
+    sqlite_db_path: Path | None = None
+
+
+def parse_managed_entry(harness: str, entry: object) -> ManagedEntry:
+    """Classify *entry* as a JEV-owned registration, ignoring preference.
+
+    Only two shapes are owned: the exact base launcher, and the exact base
+    launcher followed only by ``["--sqlite-db", ABSOLUTE_PATH]``.  Anything
+    else — extra or reordered arguments, a relative SQLite path, unrelated
+    fields, non-list launcher values — is foreign and must stay protected.
+    """
+    if not isinstance(entry, dict):
+        return ManagedEntry(ManagedVariant.FOREIGN)
+
+    try:
+        base = _raw_canonical_entry(harness)
+    except ValueError:
+        return ManagedEntry(ManagedVariant.FOREIGN)
+
+    launcher_key = next(
+        (
+            key
+            for key in ("args", "command")
+            if isinstance(base.get(key), list)
+        ),
+        None,
+    )
+    if launcher_key is None:
+        return ManagedEntry(ManagedVariant.FOREIGN)
+
+    # Every non-launcher transport field (type/transport/lifecycle, scalar
+    # command) must match exactly, and the entry must carry no extra fields.
+    if set(entry) != set(base):
+        return ManagedEntry(ManagedVariant.FOREIGN)
+    for key, expected in base.items():
+        if key == launcher_key:
+            continue
+        if entry.get(key) != expected:
+            return ManagedEntry(ManagedVariant.FOREIGN)
+
+    launcher = entry[launcher_key]
+    if not isinstance(launcher, list):
+        return ManagedEntry(ManagedVariant.FOREIGN)
+    base_launcher: list[str] = base[launcher_key]
+    # The owned launcher is the exact base list, optionally suffixed only by
+    # the SQLite pair — no reordered or inserted tokens.
+    if launcher[: len(base_launcher)] != base_launcher:
+        return ManagedEntry(ManagedVariant.FOREIGN)
+    extra = launcher[len(base_launcher):]
+    if extra == []:
+        return ManagedEntry(ManagedVariant.DISABLED)
+    if len(extra) != 2 or extra[0] != SQLITE_DB_FLAG:
+        return ManagedEntry(ManagedVariant.FOREIGN)
+
+    raw_path = extra[1]
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        return ManagedEntry(ManagedVariant.FOREIGN)
+    candidate = Path(raw_path)
+    if not candidate.is_absolute():
+        return ManagedEntry(ManagedVariant.FOREIGN)
+
+    return ManagedEntry(ManagedVariant.ENABLED, candidate)
 
 
 # ── Config read / write helpers (Task 2) ──────────────────────────────
@@ -392,11 +553,11 @@ def classify_server_entry(
 
     Returns one of:
     - ``"absent"`` — no server config file or ``jev`` key missing
-    - ``"canonical"`` — a ``jev`` entry matching the harness canonical spec
-    - ``"foreign"`` — a ``jev`` entry present but not matching the canonical spec
+    - ``"canonical"`` — a ``jev`` entry JEV owns: either the exact base
+      launcher or the exact base plus ``--sqlite-db ABSOLUTE_PATH``
+    - ``"foreign"`` — a ``jev`` entry present but not JEV-owned
     """
     scopes = registration_target(harness)
-    canonical = canonical_entry(harness)
     keys = _split_server_path(scopes.project.server_path)
 
     config = read_config(config_path, stop_root=stop_root)
@@ -408,8 +569,8 @@ def classify_server_entry(
     if not result.present:
         # Key chain is genuinely absent.
         return ServerEntryState.ABSENT
-    if result.value != canonical:
-        # Present dict doesn't match canonical spec.
+    if parse_managed_entry(harness, result.value).variant is ManagedVariant.FOREIGN:
+        # Present dict isn't a managed (disabled- or enabled-shape) entry.
         return ServerEntryState.FOREIGN
 
     return ServerEntryState.CANONICAL
@@ -424,19 +585,32 @@ def install_server(
     project_root: Path | None = None,
     user_home: Path | None = None,
     force: bool = False,
+    db_enable: bool = True,
+    sqlite_db_path: Path | None = None,
 ) -> RegistrationResult:
     """Install the JEV MCP server entry into the harness config.
 
+    The desired entry is the *enabled* canonical shape when *db_enable* is
+    ``True`` (audit-first default): ``--sqlite-db`` plus an absolute path,
+    either the explicit *sqlite_db_path* or one resolved from the scope via
+    :func:`~jev_bot.investigation_logging.resolve_sqlite_db_path`.  Passing
+    *sqlite_db_path* with *db_enable=False* is a ``ValueError``.  ``False``
+    targets the historical disabled launcher.
+
     Classification-driven:
 
-    - **Absent** — writes the canonical ``jev`` entry (new config file if
-      needed).
-    - **Canonical** — no-op; returns the config path unchanged.
+    - **Absent** — writes the desired entry (new config file if needed).
+    - **Canonical** (any JEV-owned variant) — ``EXISTS`` when the current
+      entry already equals the desired entry, otherwise the entry is
+      migrated in place (``REPLACED``) — disabled ↔ enabled or a changed
+      database path — without *force*.
     - **Foreign** — raises ``ValueError`` unless *force* is ``True``, in
-      which case it replaces **only** the ``jev`` key with the canonical
+      which case it replaces **only** the ``jev`` key with the desired
       entry (preserving sibling server entries).
 
-    Exactly one of *project_root* or *user_home* must be provided.
+    All validation (harness, scope, database path) happens before any
+    filesystem read or mutation.  Exactly one of *project_root* or
+    *user_home* must be provided.
 
     Returns
     -------
@@ -465,7 +639,18 @@ def install_server(
         stop_root = user_home
         scopes = registration_target(harness).user
 
+    # Build the desired entry first — path validation precedes any read.
+    resolved_db_path = sqlite_db_path
+    if db_enable and resolved_db_path is None:
+        resolved_db_path = resolve_sqlite_db_path(
+            project_root=project_root, user_home=user_home
+        )
+    desired = canonical_entry(
+        harness, db_enable=db_enable, sqlite_db_path=resolved_db_path
+    )
+
     config_path = stop_root / scopes.path_key
+    keys = _split_server_path(scopes.server_path)
 
     state = classify_server_entry(harness, config_path, stop_root=stop_root)
 
@@ -473,13 +658,20 @@ def install_server(
         config: dict = {}
         if config_path.exists():
             config = read_config(config_path, stop_root=stop_root)
-        _set_nested(config, _split_server_path(scopes.server_path), canonical_entry(harness))
+        _set_nested(config, keys, desired)
         _ensure_parent_dirs(config_path, stop_root=stop_root)
         write_config_atomic(config_path, config, stop_root=stop_root)
         return RegistrationResult(path=config_path, status=RegistrationStatus.CREATED)
 
     elif state == ServerEntryState.CANONICAL:
-        return RegistrationResult(path=config_path, status=RegistrationStatus.EXISTS)
+        config = read_config(config_path, stop_root=stop_root)
+        if _get_nested(config, keys) == desired:
+            return RegistrationResult(path=config_path, status=RegistrationStatus.EXISTS)
+        # Managed-variant migration: disabled → enabled, enabled → disabled,
+        # or a changed database path.  JEV owns the entry, so no force needed.
+        _set_nested(config, keys, desired)
+        write_config_atomic(config_path, config, stop_root=stop_root)
+        return RegistrationResult(path=config_path, status=RegistrationStatus.REPLACED)
 
     else:
         # FOREIGN
@@ -490,7 +682,7 @@ def install_server(
                 f"Use force=True to replace."
             )
         config = read_config(config_path, stop_root=stop_root)
-        _set_nested(config, _split_server_path(scopes.server_path), canonical_entry(harness))
+        _set_nested(config, keys, desired)
         write_config_atomic(config_path, config, stop_root=stop_root)
         return RegistrationResult(path=config_path, status=RegistrationStatus.REPLACED)
 
@@ -505,8 +697,10 @@ def uninstall_server(
 
     Classification-driven:
 
-    - **Canonical** — removes the ``jev`` key and writes back the config.
-      The empty config file is retained (no file deletion).
+    - **Canonical** — removes the ``jev`` key and writes back the config for
+      either managed variant (disabled or ``--sqlite-db``-enabled).  The
+      empty config file is retained (no file deletion).  Recording data is
+      never touched.
     - **Absent** — no-op; returns the config path.
     - **Foreign** — no mutation; returns the config path with no error.
 

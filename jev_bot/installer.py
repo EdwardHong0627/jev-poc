@@ -1,16 +1,27 @@
 """JEV installer — package-native skill installation for four harnesses.
 
-Coordinates skill installation with MCP server registration.
+Coordinates skill installation with MCP server registration and, for the
+audit-first default (``db_enable=True``), SQLite investigation-recording
+preparation: an absolute database path resolved per scope, a private
+user data directory for user scope, and an idempotent ``SQLITE_DB``
+``.gitignore`` rule for project scope.
 """
 
 from __future__ import annotations
 
 import importlib.resources
+import os
 import shutil
+import stat
+import tempfile
 from importlib.resources.abc import Traversable
 from pathlib import Path
 from typing import Tuple
 
+from jev_bot.investigation_logging import (
+    SQLITE_DB_FILENAME,
+    resolve_sqlite_db_path,
+)
 from jev_bot.mcp_registration import (
     RegistrationResult,
     install_server,
@@ -92,6 +103,7 @@ def install(
     project_root: Path | None = None,
     user_home: Path | None = None,
     force: bool = False,
+    db_enable: bool = True,
 ) -> Path:
     """Install the JEV skill and MCP registration into the *harness*'s destination.
 
@@ -104,13 +116,19 @@ def install(
     *project_root* targets the harness's project path only.
     *user_home* targets the harness's user path only.
 
+    *db_enable* (audit-first default ``True``) records successful ``jev_decide``
+    requests/responses: the MCP entry gains ``--sqlite-db`` at the scope-resolved
+    absolute path, and the destination is prepared (project ``.gitignore`` rule /
+    private user data directory) before any mutation.
+
     Returns
     -------
     Path
         The target ``SKILL.md`` path that was written.
     """
     skill_path, _result = install_with_report(
-        harness, project_root=project_root, user_home=user_home, force=force,
+        harness, project_root=project_root, user_home=user_home,
+        force=force, db_enable=db_enable,
     )
     return skill_path
 
@@ -121,13 +139,19 @@ def install_with_report(
     project_root: Path | None = None,
     user_home: Path | None = None,
     force: bool = False,
+    db_enable: bool = True,
 ) -> Tuple[Path, RegistrationResult]:
     """Install the JEV skill and MCP registration, returning the report.
 
-    Preflights both the skill source and the skill target, then the MCP
-    configuration, before any filesystem mutation.  A failure in either
-    domain leaves **no partial state** (no skill directory, no MCP config
-    change).
+    Preflights the skill source, the skill target, and (when *db_enable*) the
+    recording destination — all before any filesystem mutation.  A failure in
+    any domain leaves **no partial state** (no skill directory, no MCP config
+    change, no ``.gitignore`` or data-directory change).
+
+    *db_enable* defaults to ``True`` (audit-first): the canonical MCP entry is
+    written with ``--sqlite-db`` at the scope-resolved absolute database path.
+    ``False`` preserves the historical disabled launcher byte-for-byte and never
+    creates or deletes recording artifacts.
 
     Returns a ``(skill_path, registration_result)`` tuple where *registration_*
     *result* describes the MCP registration outcome.
@@ -161,14 +185,35 @@ def install_with_report(
     # Step 2: preflight skill target — symlink checks, no mutation.
     _preflight_skill_for_install(skill_path, stop_root)
 
-    # Step 3: preflight MCP config — raises ValueError for foreign entry
-    # or malformed/symlinked config *before* we write anything.
+    # Step 3: resolve and preflight the recording destination — raises before
+    # any mutation for relative XDG paths, symlinked or conflicting targets.
+    plan: _RecordingPlan | None = None
+    if db_enable:
+        database_path = resolve_sqlite_db_path(
+            project_root=project_root, user_home=user_home
+        )
+        plan = _preflight_recording(
+            database_path, project_root=project_root, user_home=user_home
+        )
+
+    # Step 4: preflight + migrate MCP config — raises ValueError for a foreign
+    # entry or malformed/symlinked config *before* we write the skill.
     mcp_result = install_server(
-        harness, project_root=project_root, user_home=user_home, force=force,
+        harness,
+        project_root=project_root,
+        user_home=user_home,
+        force=force,
+        db_enable=db_enable,
+        sqlite_db_path=plan.database_path if plan is not None else None,
     )
 
-    # Step 4: write the skill (safe — both domains preflighted).
+    # Step 5: write the skill (safe — all domains preflighted).
     _install_one(skill_path, stop_root, src_bytes, force)
+
+    # Step 6: apply the prepared .gitignore rule / private data directory.
+    if plan is not None:
+        _apply_recording(plan)
+
     return skill_path / "SKILL.md", mcp_result
 
 
@@ -276,6 +321,157 @@ def _preflight_skill_for_uninstall(target: Path, stop_root: Path) -> None:
     skill_md = target / "SKILL.md"
     if skill_md.is_symlink():
         raise RuntimeError(f"Cannot uninstall: {skill_md} is a symlink")
+
+
+class _RecordingPlan:
+    """Validated recording destinations prepared before any mutation."""
+
+    __slots__ = ("database_path", "gitignore_path", "gitignore_bytes", "data_dir")
+
+    def __init__(
+        self,
+        database_path: Path,
+        gitignore_path: Path | None = None,
+        gitignore_bytes: bytes | None = None,
+        data_dir: Path | None = None,
+    ) -> None:
+        self.database_path = database_path
+        self.gitignore_path = gitignore_path
+        self.gitignore_bytes = gitignore_bytes
+        self.data_dir = data_dir
+
+
+def _ensure_no_symlink(path: Path, label: str) -> None:
+    """Reject *path* itself being a symlink before it is created or written."""
+    if path.is_symlink():
+        raise RuntimeError(f"Cannot install: {label} is a symlink: {path}")
+
+
+def _gitignore_update(existing: bytes | None) -> bytes | None:
+    """Return new ``.gitignore`` bytes covering ``SQLITE_DB``, or ``None``.
+
+    ``None`` means the exact active rule already exists — the file is then
+    left byte-identical (idempotent, no duplicate rule).  Otherwise the
+    original bytes and newline style are preserved and the rule is appended
+    on its own final line.
+    """
+    rule = SQLITE_DB_FILENAME
+    if existing is not None:
+        text = existing.decode("utf-8")
+        for line in text.splitlines():
+            if line.strip() == rule:
+                return None
+        prefix = existing
+        if not text.endswith(("\n", "\r")):
+            prefix += b"\n"
+        return prefix + rule.encode("utf-8") + b"\n"
+    return rule.encode("utf-8") + b"\n"
+
+
+def _preflight_recording(
+    database_path: Path,
+    *,
+    project_root: Path | None,
+    user_home: Path | None,
+) -> _RecordingPlan:
+    """Validate recording destinations before any install mutation occurs.
+
+    Both scopes reject a symlinked or directory-shaped database path.
+    Project scope additionally requires a non-symlink non-directory
+    ``.gitignore`` (read now; the prepared update is written only after the
+    skill installs).  User scope requires a symlink-free data directory
+    (created, mode ``0700``, only after the skill installs) that is not a
+    regular file.
+    """
+    _ensure_no_symlink(database_path, "SQLite database path")
+    if database_path.is_dir():
+        raise RuntimeError(
+            f"Cannot install: SQLite database path is a directory: {database_path}"
+        )
+
+    if project_root is not None:
+        gitignore = project_root / ".gitignore"
+        _ensure_no_symlink(gitignore, "project .gitignore")
+        if gitignore.is_dir():
+            raise RuntimeError(
+                f"Cannot install: {gitignore} is a directory, not a file"
+            )
+        existing = gitignore.read_bytes() if gitignore.is_file() else None
+        return _RecordingPlan(
+            database_path=database_path,
+            gitignore_path=gitignore,
+            gitignore_bytes=_gitignore_update(existing),
+        )
+
+    assert user_home is not None  # callers enforce exactly one scope
+    data_dir = database_path.parent
+    # Every existing component from the data directory up to (but excluding)
+    # the user home must be a real directory or absent — never a symlink.
+    _find_symlink_ancestry(data_dir, user_home)
+    _ensure_no_symlink(data_dir, "user data directory")
+    _ensure_dir_ancestry(data_dir, user_home)
+    return _RecordingPlan(database_path=database_path, data_dir=data_dir)
+
+
+def _ensure_dir_ancestry(data_dir: Path, user_home: Path) -> None:
+    """Reject a data directory whose self-or-ancestor up to *user_home* is a file.
+
+    ``Path.exists()``/``is_dir()`` swallow ``ENOTDIR`` (a regular file
+    *ancestor* makes the child look absent), so the walk uses ``lstat``
+    directly: ``NotADirectoryError`` or a non-directory mode at any existing
+    component raises ``ValueError`` before any mutation occurs.
+    """
+    cur = data_dir
+    while cur != user_home and cur != cur.parent:
+        try:
+            st = os.lstat(cur)
+        except FileNotFoundError:
+            cur = cur.parent
+            continue
+        except NotADirectoryError:
+            raise ValueError(
+                f"Cannot install: an ancestor of user data directory "
+                f"{data_dir} is a regular file"
+            )
+        if not stat.S_ISDIR(st.st_mode):
+            raise ValueError(
+                f"Cannot install: user data directory {cur} is not a directory"
+            )
+        cur = cur.parent
+
+
+def _apply_recording(plan: _RecordingPlan) -> None:
+    """Apply the preflighted recording changes after the skill is installed."""
+    if plan.gitignore_path is not None and plan.gitignore_bytes is not None:
+        _write_bytes_atomic(plan.gitignore_path, plan.gitignore_bytes)
+    if plan.data_dir is not None:
+        _ensure_private_dir(plan.data_dir)
+
+
+def _write_bytes_atomic(path: Path, content: bytes) -> None:
+    """Atomically replace *path* with *content*, preserving its file mode."""
+    _ensure_no_symlink(path, str(path))
+    mode = (path.stat().st_mode & 0o777) if path.is_file() else 0o644
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.")
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp_name, mode)
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+def _ensure_private_dir(path: Path) -> None:
+    """Create *path* (parents included) and pin it to mode ``0700``."""
+    path.mkdir(parents=True, exist_ok=True)
+    os.chmod(path, 0o700)
 
 
 def _install_one(target: Path, stop_root: Path, content: bytes, force: bool) -> None:

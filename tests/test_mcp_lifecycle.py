@@ -1,4 +1,13 @@
-"""Tests for MCP server lifecycle — classification, install, uninstall (Task 3)."""
+"""Tests for MCP server lifecycle — classification, install, uninstall (Task 3).
+
+Install defaults to the audit-first SQLite opt-in (``db_enable=True``): the
+desired entry is the *enabled* canonical shape written at the scope-resolved
+database path, and managed entries (disabled or enabled-at-another-path)
+migrate in place without ``force``.  Tests mirror the implementation by
+building expectations through :func:`resolve_sqlite_db_path` with the same
+scope kwargs passed to ``install_server`` — never by hardcoding
+symlink-resolved paths (macOS ``/var`` -> ``/private/var``).
+"""
 
 from __future__ import annotations
 
@@ -7,6 +16,7 @@ import json
 import pytest
 from pathlib import Path
 
+from jev_bot.investigation_logging import resolve_sqlite_db_path
 from jev_bot.mcp_registration import (
     HARNESSES,
     REGISTRY,
@@ -46,6 +56,50 @@ def _write_json(path: Path, data: dict) -> None:
     path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
+def _expected_enabled(
+    harness: str,
+    *,
+    project: Path | None = None,
+    home: Path | None = None,
+    xdg: Path | None = None,
+) -> dict:
+    """Build the entry ``install_server(harness, project_root=project|user_home=home)``
+    must write under the audit-first default (``db_enable=True``).
+
+    The expectation mirrors the implementation exactly: the enabled canonical
+    entry at :func:`resolve_sqlite_db_path` for the same scope kwargs.  For
+    user scope, *xdg* deterministically simulates ``XDG_DATA_HOME``; when it
+    is ``None`` the resolver's fallback (``home/.local/share``) is expected,
+    and the autouse fixture below guarantees ``XDG_DATA_HOME`` is unset so
+    the process environment cannot leak in.
+    """
+    environ = {} if xdg is None else {"XDG_DATA_HOME": str(xdg)}
+    db_path = resolve_sqlite_db_path(
+        project_root=project, user_home=home, environ=environ
+    )
+    return canonical_entry(harness, db_enable=True, sqlite_db_path=db_path)
+
+
+def _launcher_list(entry: dict) -> list[str]:
+    """Return the list-form launcher field of an entry (args or opencode command)."""
+    for key in ("args", "command"):
+        value = entry.get(key)
+        if isinstance(value, list):
+            return value
+    raise AssertionError(f"entry has no list-form launcher field: {entry!r}")
+
+
+@pytest.fixture(autouse=True)
+def _pin_xdg_data_home_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Deterministically clear XDG_DATA_HOME for every test.
+
+    ``install_server`` resolves the user-scope default through the process
+    environment; dev machines may set XDG_DATA_HOME, so the audit-first
+    default tests clear it here and expect the ``.local/share`` fallback.
+    """
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+
+
 # ── 1. Server-entry classification ──────────────────────────────────
 
 
@@ -68,7 +122,9 @@ class TestClassifyCanonical:
         project = _fixture_project(tmp_path, harness)
         scopes = registration_target(harness).project
         config_path = project / scopes.path_key
-        canonical = canonical_entry(harness)
+        # Legacy disabled canonical (explicit opt-out shape) — still JEV-owned,
+        # the classifier owns both managed variants, so still CANONICAL.
+        canonical = canonical_entry(harness, db_enable=False)
         keys = scopes.server_path.split(".")
         # Build nested structure
         data: dict = {}
@@ -117,7 +173,7 @@ class TestClassifyUserScope:
 
 
 class TestInstallAbsent:
-    """Install writes canonical entry when the server entry is absent."""
+    """Install writes the enabled canonical entry when the server entry is absent."""
 
     @pytest.mark.parametrize("harness", HARNESSES)
     def test_project_scope(self, tmp_path: Path, harness: str) -> None:
@@ -133,7 +189,7 @@ class TestInstallAbsent:
         entry = data
         for key in scopes.server_path.split("."):
             entry = entry[key]
-        assert entry == canonical_entry(harness)
+        assert entry == _expected_enabled(harness, project=project)
 
 
 class TestInstallAbsentCreatesParentDirs:
@@ -151,6 +207,7 @@ class TestInstallAbsentCreatesParentDirs:
         result_path = install_server(harness, user_home=home)
 
         assert result_path.path == config_path
+        assert config_path.parent.exists()
         assert config_path.exists()
 
 
@@ -184,11 +241,11 @@ class TestInstallAbsentPreservesExistingContent:
             "type": "stdio",
             "command": "echo hello",
         }
-        # jev key is now present and canonical
+        # jev key is now present and enabled at the resolved path
         entry = data_after
         for key in keys:
             entry = entry[key]
-        assert entry == canonical_entry(harness)
+        assert entry == _expected_enabled(harness, project=project)
 
     @pytest.mark.parametrize("harness", HARNESSES)
     def test_user_scope(self, tmp_path: Path, harness: str) -> None:
@@ -206,18 +263,20 @@ class TestInstallAbsentPreservesExistingContent:
         entry = data_after
         for key in keys:
             entry = entry[key]
-        assert entry == canonical_entry(harness)
+        assert entry == _expected_enabled(harness, home=home)
 
 
 class TestInstallCanonicalNoOp:
-    """Install is a no-op when the server entry is already canonical."""
+    """Install is a no-op when the entry already equals the desired entry,
+    and migrates an older managed variant without force."""
 
     @pytest.mark.parametrize("harness", HARNESSES)
     def test_project_scope(self, tmp_path: Path, harness: str) -> None:
+        """Seed the EXACT enabled-at-resolved entry → EXISTS, content unchanged."""
         project = _fixture_project(tmp_path, harness)
         scopes = registration_target(harness).project
         config_path = project / scopes.path_key
-        canonical = canonical_entry(harness)
+        canonical = _expected_enabled(harness, project=project)
         data: dict = {}
         cur = data
         keys = scopes.server_path.split(".")
@@ -230,12 +289,38 @@ class TestInstallCanonicalNoOp:
         result_path = install_server(harness, project_root=project)
 
         assert result_path.path == config_path
-        # Content unchanged — still canonical
+        # Content unchanged — still the enabled canonical entry
         data_after = json.loads(config_path.read_text())
         entry = data_after
         for key in keys:
             entry = entry[key]
         assert entry == canonical
+
+    @pytest.mark.parametrize("harness", HARNESSES)
+    def test_managed_migration_without_force(self, tmp_path: Path, harness: str) -> None:
+        """A legacy disabled managed entry migrates to enabled without force → REPLACED."""
+        project = _fixture_project(tmp_path, harness)
+        scopes = registration_target(harness).project
+        config_path = project / scopes.path_key
+        keys = scopes.server_path.split(".")
+        # Seed the historical disabled shape (no --sqlite-db args).
+        data: dict = {}
+        cur = data
+        for key in keys[:-1]:
+            cur[key] = {}
+            cur = cur[key]
+        cur[keys[-1]] = canonical_entry(harness, db_enable=False)
+        _write_json(config_path, data)
+
+        result = install_server(harness, project_root=project)
+
+        assert result.status is RegistrationStatus.REPLACED
+        assert result.path == config_path
+        data_after = json.loads(config_path.read_text())
+        entry = data_after
+        for key in keys:
+            entry = entry[key]
+        assert entry == _expected_enabled(harness, project=project)
 
 
 class TestInstallForeignRefuses:
@@ -284,11 +369,11 @@ class TestInstallForeignForce:
         data_after = json.loads(config_path.read_text())
         # Sibling preserved
         assert data_after.get("someOtherServer") == {"type": "stdio", "command": "other"}
-        # jev is now canonical
+        # jev is now the enabled canonical entry
         entry = data_after
         for key in keys:
             entry = entry[key]
-        assert entry == canonical_entry(harness)
+        assert entry == _expected_enabled(harness, project=project)
 
 
 class TestInstallUserScope:
@@ -304,6 +389,28 @@ class TestInstallUserScope:
 
         assert result_path.path == config_path
         assert config_path.exists()
+        data_after = json.loads(config_path.read_text())
+        entry = data_after
+        for key in scopes.server_path.split("."):
+            entry = entry[key]
+        assert entry == _expected_enabled(harness, home=home)
+
+    @pytest.mark.parametrize("harness", HARNESSES)
+    def test_user_scope_honours_xdg_data_home(self, tmp_path: Path, harness: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A set XDG_DATA_HOME redirects the enabled entry's database path."""
+        home = _fixture_user_home(tmp_path, harness)
+        xdg = tmp_path / f"{harness}-xdg"
+        monkeypatch.setenv("XDG_DATA_HOME", str(xdg))
+        scopes = registration_target(harness).user
+        config_path = home / scopes.path_key
+
+        install_server(harness, user_home=home)
+
+        data_after = json.loads(config_path.read_text())
+        entry = data_after
+        for key in scopes.server_path.split("."):
+            entry = entry[key]
+        assert entry == _expected_enabled(harness, home=home, xdg=xdg)
 
 
 class TestInstallInvalidHarness:
@@ -340,7 +447,8 @@ class TestUninstallCanonical:
         project = _fixture_project(tmp_path, harness)
         scopes = registration_target(harness).project
         config_path = project / scopes.path_key
-        canonical = canonical_entry(harness)
+        # Legacy disabled managed variant — the classifier owns both shapes.
+        canonical = canonical_entry(harness, db_enable=False)
         data: dict = {}
         cur = data
         keys = scopes.server_path.split(".")
@@ -356,6 +464,36 @@ class TestUninstallCanonical:
         data_after = read_config(config_path, stop_root=project)
         assert _get_nested(data_after, keys) is None
 
+    @pytest.mark.parametrize("harness", HARNESSES)
+    def test_uninstall_removes_enabled_managed_variant(self, tmp_path: Path, harness: str) -> None:
+        """The enabled (--sqlite-db) managed variant is removed too; the config
+        file is retained and recording data is never touched."""
+        project = _fixture_project(tmp_path, harness)
+        scopes = registration_target(harness).project
+        config_path = project / scopes.path_key
+        keys = scopes.server_path.split(".")
+        enabled = _expected_enabled(harness, project=project)
+        db_path = resolve_sqlite_db_path(project_root=project)
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        db_path.write_bytes(b"recording-data")
+        data: dict = {}
+        cur = data
+        for key in keys[:-1]:
+            cur[key] = {}
+            cur = cur[key]
+        cur[keys[-1]] = enabled
+        _write_json(config_path, data)
+
+        result = uninstall_server(harness, project_root=project)
+
+        assert result.status is RegistrationStatus.REMOVED
+        assert result.path == config_path
+        data_after = read_config(config_path, stop_root=project)
+        assert _get_nested(data_after, keys) is None
+        assert config_path.exists()
+        # Recording data survives the uninstall.
+        assert db_path.read_bytes() == b"recording-data"
+
 
 class TestUninstallRetainsEmptyConfig:
     """Uninstall retains the config file even when it becomes empty (Task 3 contract)."""
@@ -365,7 +503,7 @@ class TestUninstallRetainsEmptyConfig:
         project = _fixture_project(tmp_path, harness)
         scopes = registration_target(harness).project
         config_path = project / scopes.path_key
-        canonical = canonical_entry(harness)
+        canonical = canonical_entry(harness, db_enable=False)
         keys = scopes.server_path.split(".")
         data: dict = {}
         cur = data
@@ -410,6 +548,56 @@ class TestUninstallForeignNoMutation:
             entry = entry[key]
         assert entry == {"type": "websocket", "url": "https://foreign.com"}
 
+    @pytest.mark.parametrize("harness", HARNESSES)
+    def test_enabled_with_extra_args_is_foreign(self, tmp_path: Path, harness: str) -> None:
+        """An enabled-looking launcher with extra tokens beyond the SQLite pair
+        is FOREIGN and must not be removed."""
+        project = _fixture_project(tmp_path, harness)
+        scopes = registration_target(harness).project
+        config_path = project / scopes.path_key
+        keys = scopes.server_path.split(".")
+        entry = _expected_enabled(harness, project=project)
+        _launcher_list(entry).append("--verbose")
+        data: dict = {}
+        cur = data
+        for key in keys[:-1]:
+            cur[key] = {}
+            cur = cur[key]
+        cur[keys[-1]] = entry
+        _write_json(config_path, data)
+
+        result = uninstall_server(harness, project_root=project)
+
+        assert result.status is RegistrationStatus.FOREIGN
+        data_after = read_config(config_path, stop_root=project)
+        assert _get_nested(data_after, keys) == entry
+
+    @pytest.mark.parametrize("harness", HARNESSES)
+    def test_enabled_with_reordered_suffix_is_foreign(self, tmp_path: Path, harness: str) -> None:
+        """`--sqlite-db` tokens reordered (flag after a stray token) is FOREIGN
+        and must not be removed."""
+        project = _fixture_project(tmp_path, harness)
+        scopes = registration_target(harness).project
+        config_path = project / scopes.path_key
+        keys = scopes.server_path.split(".")
+        entry = _expected_enabled(harness, project=project)
+        launcher = _launcher_list(entry)
+        # Swap the trailing [flag, path] pair into [path, flag] order.
+        launcher[-2], launcher[-1] = launcher[-1], launcher[-2]
+        data: dict = {}
+        cur = data
+        for key in keys[:-1]:
+            cur[key] = {}
+            cur = cur[key]
+        cur[keys[-1]] = entry
+        _write_json(config_path, data)
+
+        result = uninstall_server(harness, project_root=project)
+
+        assert result.status is RegistrationStatus.FOREIGN
+        data_after = read_config(config_path, stop_root=project)
+        assert _get_nested(data_after, keys) == entry
+
 
 class TestUninstallAbsentNoOp:
     """Uninstall is a no-op when the jev entry is absent."""
@@ -435,7 +623,7 @@ class TestUninstallUserScope:
         home = _fixture_user_home(tmp_path, harness)
         scopes = registration_target(harness).user
         config_path = home / scopes.path_key
-        canonical = canonical_entry(harness)
+        canonical = canonical_entry(harness, db_enable=False)
         keys = scopes.server_path.split(".")
         data: dict = {}
         cur = data
@@ -605,12 +793,12 @@ class TestInstallWithMalformedNull:
 
         install_server(harness, project_root=project, force=True)
 
-        # jev is now canonical
+        # jev is now the enabled canonical entry
         data_after = read_config(config_path, stop_root=project)
         entry = data_after
         for key in keys:
             entry = entry[key]
-        assert entry == canonical_entry(harness)
+        assert entry == _expected_enabled(harness, project=project)
         # sibling preserved
         assert data_after.get("sibling") == {"b": 2}
 
@@ -673,7 +861,7 @@ class TestInstallWithMalformedListLeaf:
         entry = data_after
         for key in keys:
             entry = entry[key]
-        assert entry == canonical_entry(harness)
+        assert entry == _expected_enabled(harness, project=project)
         assert data_after.get("sibling") == {"x": "y"}
 
 
@@ -721,7 +909,7 @@ class TestInstallWithMalformedNullForce:
         entry = data_after
         for key in keys:
             entry = entry[key]
-        assert entry == canonical_entry(harness)
+        assert entry == _expected_enabled(harness, project=project)
         assert data_after.get("sibling") == {"s": 1}
 
 
@@ -814,19 +1002,6 @@ class TestModuleImports:
     def test_no_new_external_imports(self) -> None:
         """The module should only import from stdlib, not new 3rd-party deps."""
         import jev_bot.mcp_registration as mod
-        source = """\
-import json
-import os
-import tempfile
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any
-
-import pytest
-from jev_bot.mcp_registration import (
-    ...
-)
-"""
         # Verify the module doesn't import typer, requests, mcp, dotenv, etc.
         import inspect
         source_lines = inspect.getsource(mod)
@@ -856,27 +1031,56 @@ class TestInstallServerReturnsResult:
 
 
 class TestInstallServerCanonicalReturnsResult:
-    """install_server on a canonical entry returns EXISTS, not CREATED."""
+    """Audit-first round-trip: disabled seed migrates (REPLACED), a repeat
+    default install is a no-op (EXISTS), uninstall removes it (REMOVED)."""
 
     @pytest.mark.parametrize("harness", HARNESSES)
     def test_project_scope(self, tmp_path: Path, harness: str) -> None:
         project = _fixture_project(tmp_path, harness)
         scopes = registration_target(harness).project
         config_path = project / scopes.path_key
-        canonical = canonical_entry(harness)
         keys = scopes.server_path.split(".")
+        # Seed the legacy disabled managed shape.
         data: dict = {}
         cur = data
         for key in keys[:-1]:
             cur[key] = {}
             cur = cur[key]
-        cur[keys[-1]] = canonical
+        cur[keys[-1]] = canonical_entry(harness, db_enable=False)
         _write_json(config_path, data)
 
-        result = install_server(harness, project_root=project)
+        migrate = install_server(harness, project_root=project)
+        assert migrate.status is RegistrationStatus.REPLACED
+        assert migrate.path == config_path
+        data_after = json.loads(config_path.read_text())
+        assert _get_nested(data_after, keys) == _expected_enabled(harness, project=project)
 
-        assert result.status is RegistrationStatus.EXISTS
-        assert result.path == config_path
+        again = install_server(harness, project_root=project)
+        assert again.status is RegistrationStatus.EXISTS
+        assert again.path == config_path
+        assert json.loads(config_path.read_text()) == data_after
+
+        removed = uninstall_server(harness, project_root=project)
+        assert removed.status is RegistrationStatus.REMOVED
+        assert removed.path == config_path
+        assert _get_nested(read_config(config_path, stop_root=project), keys) is None
+
+
+class TestInstallServerDisabledOptOutReturnsResult:
+    """db_enable=False still targets the historical disabled canonical shape."""
+
+    @pytest.mark.parametrize("harness", HARNESSES)
+    def test_project_scope(self, tmp_path: Path, harness: str) -> None:
+        project = _fixture_project(tmp_path, harness)
+        scopes = registration_target(harness).project
+        config_path = project / scopes.path_key
+        keys = scopes.server_path.split(".")
+
+        result = install_server(harness, project_root=project, db_enable=False)
+
+        assert result.status is RegistrationStatus.CREATED
+        data_after = read_config(config_path, stop_root=project)
+        assert _get_nested(data_after, keys) == canonical_entry(harness, db_enable=False)
 
 
 class TestInstallServerForeignForceReturnsResult:
@@ -900,6 +1104,8 @@ class TestInstallServerForeignForceReturnsResult:
 
         assert result.status is RegistrationStatus.REPLACED
         assert result.path == config_path
+        data_after = read_config(config_path, stop_root=project)
+        assert _get_nested(data_after, keys) == _expected_enabled(harness, project=project)
 
 
 class TestUninstallServerCanonicalReturnsResult:
@@ -910,7 +1116,7 @@ class TestUninstallServerCanonicalReturnsResult:
         project = _fixture_project(tmp_path, harness)
         scopes = registration_target(harness).project
         config_path = project / scopes.path_key
-        canonical = canonical_entry(harness)
+        canonical = canonical_entry(harness, db_enable=False)
         keys = scopes.server_path.split(".")
         data: dict = {}
         cur = data
@@ -968,4 +1174,3 @@ class TestUninstallServerForeignReturnsResult:
         for k in keys:
             entry = entry[k]  # type: ignore[index]
         assert entry == {"type": "websocket", "url": "https://foreign.com"}
-
